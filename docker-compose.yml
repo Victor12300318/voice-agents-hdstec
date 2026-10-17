@@ -1,5 +1,5 @@
 services:
-  postgres:
+  va-postgres:
     image: postgres:17-alpine
     restart: unless-stopped
     environment:
@@ -14,7 +14,7 @@ services:
       timeout: 3s
       retries: 20
 
-  redis:
+  va-redis:
     image: redis:7-alpine
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
@@ -26,13 +26,13 @@ services:
       timeout: 3s
       retries: 20
 
-  backend:
+  va-backend:
     build: ./backend
     restart: unless-stopped
     environment:
       HTTP_ADDR: ":8080"
-      DATABASE_URL: postgres://${POSTGRES_USER:-voiceagent}:${POSTGRES_PASSWORD:-voiceagent}@postgres:5432/${POSTGRES_DB:-voiceagent}?sslmode=disable
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgres://${POSTGRES_USER:-voiceagent}:${POSTGRES_PASSWORD:-voiceagent}@va-postgres:5432/${POSTGRES_DB:-voiceagent}?sslmode=disable
+      REDIS_URL: redis://va-redis:6379/0
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
       ORG_NAME: ${ORG_NAME:-Minha Organização}
@@ -55,9 +55,9 @@ services:
     volumes:
       - minio-data:/data/recordings
     depends_on:
-      postgres:
+      va-postgres:
         condition: service_healthy
-      redis:
+      va-redis:
         condition: service_healthy
 
   frontend:
@@ -66,7 +66,7 @@ services:
     ports:
       - "${FRONTEND_PORT:-8088}:8088"
     depends_on:
-      - backend
+      - va-backend
 
 volumes:
   postgres-data:

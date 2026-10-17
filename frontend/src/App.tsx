@@ -16,7 +16,7 @@ import {
   PanelLeft,
   MoreHorizontal,
 } from 'lucide-react'
-import { api, ApiError, type Me, type Agent } from './api'
+import { api, type Me, type Agent } from './api'
 import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import Conversations from './pages/Conversations'
@@ -55,9 +55,8 @@ export default function App() {
           .then((list) => setSidebarAgents(list || []))
           .catch(() => {})
       })
-      .catch((e) => {
-        if (e instanceof ApiError && e.status === 401) setMe(null)
-        else throw e
+      .catch(() => {
+        setMe(null)
       })
 
   useEffect(() => {

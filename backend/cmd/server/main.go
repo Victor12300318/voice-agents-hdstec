@@ -60,13 +60,38 @@ func serve(cfg config.Config, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.Open(ctx, cfg.DatabaseURL)
+	var st *store.Store
+	var err error
+	for attempt := 1; attempt <= 15; attempt++ {
+		st, err = store.Open(ctx, cfg.DatabaseURL)
+		if err == nil {
+			break
+		}
+		log.Warn("waiting_for_postgres", "attempt", attempt, "error", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("postgres: %w", err)
 	}
 	defer st.Close()
 
-	rdb, err := openRedis(ctx, cfg.RedisURL)
+	var rdb *redis.Client
+	for attempt := 1; attempt <= 15; attempt++ {
+		rdb, err = openRedis(ctx, cfg.RedisURL)
+		if err == nil {
+			break
+		}
+		log.Warn("waiting_for_redis", "attempt", attempt, "error", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("redis: %w", err)
 	}
