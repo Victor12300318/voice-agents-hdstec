@@ -1,0 +1,120 @@
+name: voiceagent
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-voiceagent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}
+      POSTGRES_DB: ${POSTGRES_DB:-voiceagent}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-voiceagent} -d ${POSTGRES_DB:-voiceagent}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-voiceagent}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?defina MINIO_ROOT_PASSWORD no .env}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "127.0.0.1:9001:9001"
+
+  backend:
+    build: ./backend
+    environment:
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://${POSTGRES_USER:-voiceagent}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-voiceagent}?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ORG_NAME: ${ORG_NAME:-Minha Organização}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-voiceagent}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET:-recordings}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      JAMBONZ_API_URL: ${JAMBONZ_API_URL:-}
+      JAMBONZ_API_KEY: ${JAMBONZ_API_KEY:-}
+      JAMBONZ_ACCOUNT_SID: ${JAMBONZ_ACCOUNT_SID:-}
+      PUBLIC_WS_URL: ${PUBLIC_WS_URL:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-typesafe/jev-router}
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "${FRONTEND_PORT:-8088}:80"
+    depends_on:
+      - backend
+
+  # Testes de integraÃ§Ã£o do backend: docker compose --profile test run --rm backend-test
+  postgres-test:
+    image: postgres:17-alpine
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: test
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test -d test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  backend-test:
+    image: golang:1.26-alpine
+    profiles: ["test"]
+    working_dir: /src
+    command: ["go", "test", "./..."]
+    environment:
+      CGO_ENABLED: "0"
+      TEST_DATABASE_URL: postgres://test:test@postgres-test:5432/test?sslmode=disable
+      TEST_REDIS_URL: redis://redis:6379/15
+      TEST_GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    volumes:
+      - ./backend:/src
+      - go-mod-cache:/go/pkg/mod
+      - go-build-cache:/root/.cache/go-build
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  go-mod-cache:
+  go-build-cache:

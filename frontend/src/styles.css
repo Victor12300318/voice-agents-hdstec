@@ -1,0 +1,98 @@
+@import "tailwindcss";
+
+/* ============================================================
+   Design tokens (Apple-style) — Tailwind v4 @theme
+   ============================================================ */
+@theme {
+  /* Fonts — system/SF first; already optically tuned & legible */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+    system-ui, Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", monospace;
+
+  /* Elevation — bigger surfaces read thicker (deeper shadow) */
+  --shadow-float: 0 4px 16px -4px rgba(0, 0, 0, 0.12);
+  --shadow-sheet: 0 10px 40px -4px rgba(0, 0, 0, 0.18),
+    0 2px 8px -2px rgba(0, 0, 0, 0.1);
+  --shadow-modal: 0 24px 64px -8px rgba(0, 0, 0, 0.28),
+    0 4px 12px -4px rgba(0, 0, 0, 0.12);
+
+  /* Radii */
+  --radius-sheet: 1.25rem;
+}
+
+/* ============================================================
+   Materials & motion helpers
+   ============================================================ */
+
+/* Translucent chrome — content scrolls underneath (§12) */
+.material-chrome {
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+}
+.material-sidebar {
+  background: rgba(250, 250, 250, 0.8);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+}
+
+/* Display type — negative tracking as it grows, tight leading (§15) */
+.text-display {
+  letter-spacing: -0.02em;
+  line-height: 1.05;
+  font-optical-sizing: auto;
+}
+
+/* ============================================================
+   Accessibility — reduced motion / transparency / contrast (§14)
+   ============================================================ */
+@media (prefers-reduced-transparency: reduce) {
+  .material-chrome { background: #fff; backdrop-filter: none; -webkit-backdrop-filter: none; }
+  .material-sidebar { background: #fafafa; backdrop-filter: none; -webkit-backdrop-filter: none; }
+}
+@media (prefers-contrast: more) {
+  .material-chrome,
+  .material-sidebar { background: #fff; border-color: #000; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ============================================================
+   Base
+   ============================================================ */
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: #111;
+  background: #fafafa;
+}
+
+textarea { resize: vertical; }
+
+/* ============================================================
+   Craft — calm, thin scrollbars (§16)
+   ============================================================ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.2) transparent;
+}
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.18);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: rgba(0, 0, 0, 0.32); background-clip: content-box; }
