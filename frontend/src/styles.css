@@ -80,6 +80,18 @@ body {
 
 textarea { resize: vertical; }
 
+button:focus-visible,
+a:focus-visible,
+select:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid rgba(24, 24, 27, 0.85);
+  outline-offset: 2px;
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.985);
+}
+
 /* ============================================================
    Craft — calm, thin scrollbars (§16)
    ============================================================ */

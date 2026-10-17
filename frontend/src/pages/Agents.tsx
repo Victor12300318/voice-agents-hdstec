@@ -1,5 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { AnimatePresence, motion } from 'motion/react'
+import { springStudio, transitionPopover } from '../components/motion'
 import {
   Plus,
   Search,
@@ -311,12 +313,15 @@ export default function Agents() {
                 </td>
               </tr>
             ) : (
-              filtered.map((a) => {
+              filtered.map((a, idx) => {
                 const count7d = convCount7dByAgent[a.id] || 0
                 const isMenuOpen = openMenuId === a.id
                 return (
-                  <tr
+                  <motion.tr
                     key={a.id}
+                    initial={{ opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ ...springStudio, delay: Math.min(idx, 12) * 0.022 }}
                     onClick={() => navigate(`/agents/${a.id}`)}
                     className="group hover:bg-zinc-50/80 transition-colors cursor-pointer"
                   >
@@ -355,49 +360,58 @@ export default function Agents() {
                         <MoreHorizontal className="w-4 h-4" />
                       </button>
 
-                      {isMenuOpen && (
-                        <div className="absolute right-0 top-11 z-30 w-48 bg-white border border-zinc-200/90 rounded-xl shadow-lg py-1 text-xs text-left">
-                          <button
-                            type="button"
-                            onClick={() => navigate(`/agents/${a.id}`)}
-                            className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
+                      <AnimatePresence>
+                        {isMenuOpen && (
+                          <motion.div
+                            key={`menu-${a.id}`}
+                            initial={{ opacity: 0, scale: 0.96, y: -4 }}
+                            animate={{ opacity: 1, scale: 1, y: 0 }}
+                            exit={{ opacity: 0, scale: 0.96, y: -2 }}
+                            transition={transitionPopover}
+                            className="absolute right-0 top-11 z-30 w-48 bg-white border border-zinc-200/90 rounded-xl shadow-lg py-1 text-xs text-left origin-top-right"
                           >
-                            <Settings className="w-3.5 h-3.5 text-zinc-400" />
-                            Configurar agente
-                          </button>
+                            <button
+                              type="button"
+                              onClick={() => navigate(`/agents/${a.id}`)}
+                              className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
+                            >
+                              <Settings className="w-3.5 h-3.5 text-zinc-400" />
+                              Configurar agente
+                            </button>
 
-                          <button
-                            type="button"
-                            onClick={() => navigate(`/agents/${a.id}/test`)}
-                            className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
-                          >
-                            <Play className="w-3.5 h-3.5 text-zinc-400" />
-                            Testar conversa
-                          </button>
+                            <button
+                              type="button"
+                              onClick={() => navigate(`/agents/${a.id}/test`)}
+                              className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
+                            >
+                              <Play className="w-3.5 h-3.5 text-zinc-400" />
+                              Testar conversa
+                            </button>
 
-                          <button
-                            type="button"
-                            onClick={() => handleDuplicate(a)}
-                            className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
-                          >
-                            <Copy className="w-3.5 h-3.5 text-zinc-400" />
-                            Duplicar agente
-                          </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDuplicate(a)}
+                              className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
+                            >
+                              <Copy className="w-3.5 h-3.5 text-zinc-400" />
+                              Duplicar agente
+                            </button>
 
-                          <div className="my-1 border-t border-zinc-100" />
+                            <div className="my-1 border-t border-zinc-100" />
 
-                          <button
-                            type="button"
-                            onClick={() => handleToggleActive(a)}
-                            className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
-                          >
-                            <Power className="w-3.5 h-3.5 text-zinc-400" />
-                            {a.active ? 'Desativar agente' : 'Ativar agente'}
-                          </button>
-                        </div>
-                      )}
+                            <button
+                              type="button"
+                              onClick={() => handleToggleActive(a)}
+                              className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
+                            >
+                              <Power className="w-3.5 h-3.5 text-zinc-400" />
+                              {a.active ? 'Desativar agente' : 'Ativar agente'}
+                            </button>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
                     </td>
-                  </tr>
+                  </motion.tr>
                 )
               })
             )}

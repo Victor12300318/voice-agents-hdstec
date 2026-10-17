@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
+import { AnimatePresence, motion } from 'motion/react'
+import { springBubble, springTabPill, transitionPage } from '../components/motion'
 import {
   ArrowLeft,
   Volume2,
@@ -458,24 +460,40 @@ export default function ConversationDetailPage() {
         <div className="flex gap-4">
           <button
             onClick={() => setActiveTab('transcript')}
-            className={`pb-2.5 border-b-2 -mb-px transition-colors cursor-pointer ${
+            className={`relative pb-2.5 -mb-px transition-colors cursor-pointer ${
               activeTab === 'transcript'
-                ? 'border-zinc-900 text-zinc-950 font-semibold'
-                : 'border-transparent text-zinc-500 hover:text-zinc-800'
+                ? 'text-zinc-950 font-semibold'
+                : 'text-zinc-500 hover:text-zinc-800'
             }`}
           >
             Transcrição da Conversa
+            {activeTab === 'transcript' && (
+              <motion.span
+                layoutId="conv-detail-tab-indicator"
+                transition={springTabPill}
+                className="absolute inset-x-0 bottom-0 h-0.5 bg-zinc-900 rounded-full"
+                aria-hidden="true"
+              />
+            )}
           </button>
           <button
             onClick={() => setActiveTab('logs')}
-            className={`pb-2.5 border-b-2 -mb-px transition-colors cursor-pointer flex items-center gap-1.5 ${
+            className={`relative pb-2.5 -mb-px transition-colors cursor-pointer flex items-center gap-1.5 ${
               activeTab === 'logs'
-                ? 'border-zinc-900 text-zinc-950 font-semibold'
-                : 'border-transparent text-zinc-500 hover:text-zinc-800'
+                ? 'text-zinc-950 font-semibold'
+                : 'text-zinc-500 hover:text-zinc-800'
             }`}
           >
             <Terminal className="w-3.5 h-3.5" />
             Logs de Execução & Tools ({execs?.length || 0})
+            {activeTab === 'logs' && (
+              <motion.span
+                layoutId="conv-detail-tab-indicator"
+                transition={springTabPill}
+                className="absolute inset-x-0 bottom-0 h-0.5 bg-zinc-900 rounded-full"
+                aria-hidden="true"
+              />
+            )}
           </button>
         </div>
 
@@ -501,18 +519,32 @@ export default function ConversationDetailPage() {
       </div>
 
       {/* Tab 1: Transcript Consolidada e Legível */}
+      <AnimatePresence mode="wait">
       {activeTab === 'transcript' && (
-        <div className="bg-white border border-zinc-200/80 rounded-2xl p-6 shadow-xs space-y-4">
+        <motion.div
+          key="tab-transcript"
+          initial={{ opacity: 0, y: 6 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, transition: { duration: 0.12 } }}
+          transition={transitionPage}
+          className="bg-white border border-zinc-200/80 rounded-2xl p-6 shadow-xs space-y-4"
+        >
           {timeline.length === 0 ? (
             <div className="py-12 text-center text-xs text-zinc-400">
               Nenhuma fala registrada na transcrição desta conversa.
             </div>
           ) : (
             <div className="space-y-4">
-              {timeline.map((item) => {
+              {timeline.map((item, idx) => {
                 if (item.kind === 'badge') {
                   return (
-                    <div key={item.id} className="flex justify-center my-1.5">
+                    <motion.div
+                      key={item.id}
+                      initial={{ opacity: 0, scale: 0.94, y: 4 }}
+                      animate={{ opacity: 1, scale: 1, y: 0 }}
+                      transition={{ ...springBubble, delay: Math.min(idx, 12) * 0.018 }}
+                      className="flex justify-center my-1.5"
+                    >
                       <span
                         className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-medium border ${
                           item.badgeType === 'procedure'
@@ -539,7 +571,7 @@ export default function ConversationDetailPage() {
                         <span>{item.label}</span>
                         <span className="opacity-60 font-mono text-[10px]">• {item.timeStr}</span>
                       </span>
-                    </div>
+                    </motion.div>
                   )
                 }
 
@@ -547,8 +579,11 @@ export default function ConversationDetailPage() {
                 const isCopied = copiedBubbleId === item.id
 
                 return (
-                  <div
+                  <motion.div
                     key={item.id}
+                    initial={{ opacity: 0, x: isCaller ? 8 : -8, y: 4 }}
+                    animate={{ opacity: 1, x: 0, y: 0 }}
+                    transition={{ ...springBubble, delay: Math.min(idx, 12) * 0.018 }}
                     className={`flex items-start gap-3 group ${
                       isCaller ? 'justify-end' : 'justify-start'
                     }`}
@@ -615,17 +650,24 @@ export default function ConversationDetailPage() {
                         <User className="w-3.5 h-3.5" />
                       </div>
                     )}
-                  </div>
+                  </motion.div>
                 )
               })}
             </div>
           )}
-        </div>
+        </motion.div>
       )}
 
       {/* Tab 2: Execution Logs */}
       {activeTab === 'logs' && (
-        <div className="space-y-4">
+        <motion.div
+          key="tab-logs"
+          initial={{ opacity: 0, y: 6 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, transition: { duration: 0.12 } }}
+          transition={transitionPage}
+          className="space-y-4"
+        >
           <div className="bg-white border border-zinc-200/80 rounded-xl p-5 shadow-xs space-y-3">
             <h4 className="text-xs font-semibold text-zinc-700 uppercase tracking-wider flex items-center gap-1.5">
               <Wrench className="w-4 h-4 text-zinc-500" />
@@ -693,8 +735,9 @@ export default function ConversationDetailPage() {
               ))}
             </div>
           </div>
-        </div>
+        </motion.div>
       )}
+      </AnimatePresence>
     </div>
   )
 }

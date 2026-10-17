@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
+import { AnimatePresence, motion } from 'motion/react'
+import { springTabPill, transitionPopover } from '../components/motion'
 import {
   Calendar,
   ChevronLeft,
@@ -643,13 +645,21 @@ export default function Dashboard() {
             key={tab.id}
             type="button"
             onClick={() => setSectionTab(tab.id)}
-            className={`pb-2.5 border-b-2 transition-colors whitespace-nowrap cursor-pointer ${
+            className={`relative pb-2.5 transition-colors whitespace-nowrap cursor-pointer ${
               sectionTab === tab.id
-                ? 'border-zinc-950 text-zinc-950 font-semibold'
-                : 'border-transparent text-zinc-500 hover:text-zinc-800'
+                ? 'text-zinc-950 font-semibold'
+                : 'text-zinc-500 hover:text-zinc-800'
             }`}
           >
             {tab.label}
+            {sectionTab === tab.id && (
+              <motion.span
+                layoutId="dashboard-section-tab-indicator"
+                transition={springTabPill}
+                className="absolute inset-x-0 bottom-0 h-0.5 bg-zinc-950 rounded-full"
+                aria-hidden="true"
+              />
+            )}
           </button>
         ))}
       </div>
@@ -707,8 +717,16 @@ export default function Dashboard() {
               </div>
 
               {/* POPOVER DO CALENDÁRIO DUPLO E PRESETS (Idêntico à Imagem 1) */}
+              <AnimatePresence>
               {isDatePopoverOpen && (
-                <div className="absolute left-0 top-10 z-40 w-[690px] max-w-[94vw] bg-white border border-zinc-200/90 rounded-2xl shadow-2xl overflow-hidden text-xs select-none">
+                <motion.div
+                  key="date-range-popover"
+                  initial={{ opacity: 0, scale: 0.96, y: -4 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.96, y: -2 }}
+                  transition={transitionPopover}
+                  className="absolute left-0 top-10 z-40 w-[690px] max-w-[94vw] bg-white border border-zinc-200/90 rounded-2xl shadow-2xl overflow-hidden text-xs select-none origin-top-left"
+                >
                   <div className="flex flex-col md:flex-row">
                     {/* Coluna Esquerda: Presets Rápidos */}
                     <div className="w-full md:w-48 border-b md:border-b-0 md:border-r border-zinc-100 p-1.5 space-y-0.5 max-h-[380px] overflow-y-auto">
@@ -900,8 +918,9 @@ export default function Dashboard() {
                     <strong className="font-semibold text-zinc-900">America/Sao_Paulo</strong>
                     <span className="text-zinc-400">(UTC-3)</span>
                   </div>
-                </div>
+                </motion.div>
               )}
+              </AnimatePresence>
             </div>
 
             {/* Pílula: Granularidade | Por Hora v */}
@@ -939,8 +958,16 @@ export default function Dashboard() {
                   : `Agente: ${agents.find((a) => a.id === selectedAgentId)?.name || ''}`}
               </button>
 
+              <AnimatePresence>
               {isAgentMenuOpen && (
-                <div className="absolute left-0 top-10 z-30 w-56 bg-white border border-zinc-200/90 rounded-xl shadow-xl p-1.5 space-y-0.5">
+                <motion.div
+                  key="agent-filter-menu"
+                  initial={{ opacity: 0, scale: 0.96, y: -4 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.96, y: -2 }}
+                  transition={transitionPopover}
+                  className="absolute left-0 top-10 z-30 w-56 bg-white border border-zinc-200/90 rounded-xl shadow-xl p-1.5 space-y-0.5 origin-top-left"
+                >
                   <button
                     type="button"
                     onClick={() => {
@@ -974,8 +1001,9 @@ export default function Dashboard() {
                       {selectedAgentId === ag.id && <Check className="w-3.5 h-3.5" />}
                     </button>
                   ))}
-                </div>
+                </motion.div>
               )}
+              </AnimatePresence>
             </div>
 
             {/* Pílula: + Agrupar por */}

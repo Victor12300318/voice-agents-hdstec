@@ -9,7 +9,8 @@ import NotionProcedureWorkspace from '../components/NotionProcedureWorkspace'
 import { RichPromptCard, SYSTEM_VARIABLES_CATALOG } from '../components/VariablesPopoverModal'
 import ElevenToolsPanel from '../components/ElevenToolsPanel'
 import ElevenToolDrawer, { type ToolCategory } from '../components/ElevenToolDrawer'
-import { haptic } from '../components/motion'
+import { AnimatePresence, motion } from 'motion/react'
+import { haptic, springTabPill, transitionPage } from '../components/motion'
 import {
   api,
   type AgentDetail,
@@ -1034,20 +1035,28 @@ export default function AgentEditor() {
                     type="button"
                     onClick={() => selectSection(item.key)}
                     title={item.label}
-                    className={`w-full flex items-center ${
+                    className={`relative w-full flex items-center ${
                       sidebarCollapsed ? 'justify-center py-2' : 'gap-2.5 px-2.5 py-1.5'
                     } rounded-xl text-xs transition-colors ${
                       isActive
-                        ? 'bg-zinc-200/75 text-zinc-950 font-semibold'
-                        : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'
+                        ? 'text-zinc-950 font-semibold'
+                        : 'text-zinc-600 hover:bg-zinc-100/80 hover:text-zinc-900'
                     }`}
                   >
+                    {isActive && (
+                      <motion.span
+                        layoutId="agent-editor-sidebar-pill"
+                        transition={springTabPill}
+                        className="absolute inset-0 rounded-xl bg-zinc-200/75"
+                        aria-hidden="true"
+                      />
+                    )}
                     <Icon
-                      className={`w-4 h-4 flex-shrink-0 ${
+                      className={`relative z-10 w-4 h-4 flex-shrink-0 ${
                         isActive ? 'text-zinc-900' : 'text-zinc-500'
                       }`}
                     />
-                    {!sidebarCollapsed && <span className="truncate">{item.label}</span>}
+                    {!sidebarCollapsed && <span className="relative z-10 truncate">{item.label}</span>}
                   </button>
                 )
               })}
@@ -1202,6 +1211,14 @@ export default function AgentEditor() {
 
         {/* CONTEÚDO ROLÁVEL DA SEÇÃO ATIVA */}
         <main className="flex-1 overflow-y-auto">
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={currentTab}
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, transition: { duration: 0.12 } }}
+              transition={transitionPage}
+            >
           {currentTab === 'geral' && (
             /* ===============================================================
                ORGANIZAÇÃO IDÊNTICA ÀS IMAGENS 1 E 2 (TELA "AGENTE")
@@ -1935,6 +1952,8 @@ export default function AgentEditor() {
               </div>
             </div>
           )}
+            </motion.div>
+          </AnimatePresence>
         </main>
       </div>
 

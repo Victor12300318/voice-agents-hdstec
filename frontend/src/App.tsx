@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
+import { AnimatePresence, motion } from 'motion/react'
+import { springTabPill, transitionPage } from './components/motion'
 import {
   Home,
   FolderOpen,
@@ -205,17 +207,29 @@ export default function App() {
               to="/dashboard"
               title="Início"
               className={({ isActive }) =>
-                `flex items-center ${
+                `relative flex items-center ${
                   sidebarCollapsed ? 'justify-center py-2' : 'gap-2.5 px-2.5 py-1.5'
                 } rounded-xl text-xs transition-colors ${
                   isActive
-                    ? 'bg-zinc-200/75 text-zinc-950 font-semibold'
-                    : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'
+                    ? 'text-zinc-950 font-semibold'
+                    : 'text-zinc-600 hover:bg-zinc-100/80 hover:text-zinc-900'
                 }`
               }
             >
-              <Home className="w-4 h-4 text-zinc-500 flex-shrink-0" />
-              {!sidebarCollapsed && <span>Início</span>}
+              {({ isActive }) => (
+                <>
+                  {isActive && (
+                    <motion.span
+                      layoutId="sidebar-active-pill"
+                      transition={springTabPill}
+                      className="absolute inset-0 rounded-xl bg-zinc-200/75"
+                      aria-hidden="true"
+                    />
+                  )}
+                  <Home className="relative z-10 w-4 h-4 text-zinc-500 flex-shrink-0" />
+                  {!sidebarCollapsed && <span className="relative z-10">Início</span>}
+                </>
+              )}
             </NavLink>
           </div>
 
@@ -243,6 +257,7 @@ export default function App() {
                 >
                   <div
                     className={`w-4 h-4 rounded-full bg-gradient-to-tr ${grad} flex-shrink-0 shadow-2xs`}
+                    aria-hidden="true"
                   />
                   {!sidebarCollapsed && <span className="truncate">{ag.name}</span>}
                 </NavLink>
@@ -251,19 +266,32 @@ export default function App() {
 
             <NavLink
               to="/agents"
+              end
               title="Todos os agentes"
               className={({ isActive }) =>
-                `flex items-center ${
+                `relative flex items-center ${
                   sidebarCollapsed ? 'justify-center py-2' : 'gap-2.5 px-2.5 py-1.5'
                 } rounded-xl text-xs transition-colors ${
                   isActive
-                    ? 'bg-zinc-200/75 text-zinc-950 font-semibold'
-                    : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'
+                    ? 'text-zinc-950 font-semibold'
+                    : 'text-zinc-600 hover:bg-zinc-100/80 hover:text-zinc-900'
                 }`
               }
             >
-              <MoreHorizontal className="w-4 h-4 text-zinc-500 flex-shrink-0" />
-              {!sidebarCollapsed && <span>Mais</span>}
+              {({ isActive }) => (
+                <>
+                  {isActive && (
+                    <motion.span
+                      layoutId="sidebar-active-pill"
+                      transition={springTabPill}
+                      className="absolute inset-0 rounded-xl bg-zinc-200/75"
+                      aria-hidden="true"
+                    />
+                  )}
+                  <MoreHorizontal className="relative z-10 w-4 h-4 text-zinc-500 flex-shrink-0" />
+                  {!sidebarCollapsed && <span className="relative z-10">Mais</span>}
+                </>
+              )}
             </NavLink>
           </div>
 
@@ -282,17 +310,31 @@ export default function App() {
                   to={item.path}
                   title={item.label}
                   className={({ isActive }) =>
-                    `flex items-center ${
+                    `relative flex items-center ${
                       sidebarCollapsed ? 'justify-center py-2' : 'gap-2.5 px-2.5 py-1.5'
                     } rounded-xl text-xs transition-colors ${
                       isActive
-                        ? 'bg-zinc-200/75 text-zinc-950 font-semibold'
-                        : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'
+                        ? 'text-zinc-950 font-semibold'
+                        : 'text-zinc-600 hover:bg-zinc-100/80 hover:text-zinc-900'
                     }`
                   }
                 >
-                  <Icon className="w-4 h-4 text-zinc-500 flex-shrink-0" />
-                  {!sidebarCollapsed && <span className="truncate">{item.label}</span>}
+                  {({ isActive }) => (
+                    <>
+                      {isActive && (
+                        <motion.span
+                          layoutId="sidebar-active-pill"
+                          transition={springTabPill}
+                          className="absolute inset-0 rounded-xl bg-zinc-200/75"
+                          aria-hidden="true"
+                        />
+                      )}
+                      <Icon className="relative z-10 w-4 h-4 text-zinc-500 flex-shrink-0" />
+                      {!sidebarCollapsed && (
+                        <span className="relative z-10 truncate">{item.label}</span>
+                      )}
+                    </>
+                  )}
                 </NavLink>
               )
             })}
@@ -313,17 +355,31 @@ export default function App() {
                   to={item.path}
                   title={item.label}
                   className={({ isActive }) =>
-                    `flex items-center ${
+                    `relative flex items-center ${
                       sidebarCollapsed ? 'justify-center py-2' : 'gap-2.5 px-2.5 py-1.5'
                     } rounded-xl text-xs transition-colors ${
                       isActive
-                        ? 'bg-zinc-200/75 text-zinc-950 font-semibold'
-                        : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'
+                        ? 'text-zinc-950 font-semibold'
+                        : 'text-zinc-600 hover:bg-zinc-100/80 hover:text-zinc-900'
                     }`
                   }
                 >
-                  <Icon className="w-4 h-4 text-zinc-500 flex-shrink-0" />
-                  {!sidebarCollapsed && <span className="truncate">{item.label}</span>}
+                  {({ isActive }) => (
+                    <>
+                      {isActive && (
+                        <motion.span
+                          layoutId="sidebar-active-pill"
+                          transition={springTabPill}
+                          className="absolute inset-0 rounded-xl bg-zinc-200/75"
+                          aria-hidden="true"
+                        />
+                      )}
+                      <Icon className="relative z-10 w-4 h-4 text-zinc-500 flex-shrink-0" />
+                      {!sidebarCollapsed && (
+                        <span className="relative z-10 truncate">{item.label}</span>
+                      )}
+                    </>
+                  )}
                 </NavLink>
               )
             })}
@@ -344,17 +400,31 @@ export default function App() {
                   to={item.path}
                   title={item.label}
                   className={({ isActive }) =>
-                    `flex items-center ${
+                    `relative flex items-center ${
                       sidebarCollapsed ? 'justify-center py-2' : 'gap-2.5 px-2.5 py-1.5'
                     } rounded-xl text-xs transition-colors ${
                       isActive
-                        ? 'bg-zinc-200/75 text-zinc-950 font-semibold'
-                        : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'
+                        ? 'text-zinc-950 font-semibold'
+                        : 'text-zinc-600 hover:bg-zinc-100/80 hover:text-zinc-900'
                     }`
                   }
                 >
-                  <Icon className="w-4 h-4 text-zinc-500 flex-shrink-0" />
-                  {!sidebarCollapsed && <span className="truncate">{item.label}</span>}
+                  {({ isActive }) => (
+                    <>
+                      {isActive && (
+                        <motion.span
+                          layoutId="sidebar-active-pill"
+                          transition={springTabPill}
+                          className="absolute inset-0 rounded-xl bg-zinc-200/75"
+                          aria-hidden="true"
+                        />
+                      )}
+                      <Icon className="relative z-10 w-4 h-4 text-zinc-500 flex-shrink-0" />
+                      {!sidebarCollapsed && (
+                        <span className="relative z-10 truncate">{item.label}</span>
+                      )}
+                    </>
+                  )}
                 </NavLink>
               )
             })}
@@ -410,22 +480,32 @@ export default function App() {
 
         {/* Conteúdo da Página */}
         <main className="flex-1 p-6 sm:p-8 overflow-y-auto bg-white">
-          <Routes>
-            <Route path="/dashboard" element={<Dashboard />} />
-            <Route path="/conversations" element={<Conversations />} />
-            <Route path="/conversations/:id" element={<ConversationDetailPage />} />
-            <Route path="/agents" element={<Agents />} />
-            <Route path="/agents/:id" element={<AgentEditor />} />
-            <Route path="/agents/:id/test" element={<AgentTest />} />
-            <Route path="/skills" element={<SkillsPage />} />
-            <Route path="/mcps" element={<MCPsPage />} />
-            <Route path="/knowledge" element={<KnowledgeBases />} />
-            <Route path="/phone-numbers" element={<PhoneNumbersPage />} />
-            <Route path="/analytics" element={<AnalyticsPage />} />
-            <Route path="/organization/settings" element={<SettingsPage />} />
-            <Route path="/organization/members" element={<MembersPage />} />
-            <Route path="*" element={<Navigate to="/agents" replace />} />
-          </Routes>
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={location.pathname}
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, transition: { duration: 0.12 } }}
+              transition={transitionPage}
+            >
+              <Routes location={location}>
+                <Route path="/dashboard" element={<Dashboard />} />
+                <Route path="/conversations" element={<Conversations />} />
+                <Route path="/conversations/:id" element={<ConversationDetailPage />} />
+                <Route path="/agents" element={<Agents />} />
+                <Route path="/agents/:id" element={<AgentEditor />} />
+                <Route path="/agents/:id/test" element={<AgentTest />} />
+                <Route path="/skills" element={<SkillsPage />} />
+                <Route path="/mcps" element={<MCPsPage />} />
+                <Route path="/knowledge" element={<KnowledgeBases />} />
+                <Route path="/phone-numbers" element={<PhoneNumbersPage />} />
+                <Route path="/analytics" element={<AnalyticsPage />} />
+                <Route path="/organization/settings" element={<SettingsPage />} />
+                <Route path="/organization/members" element={<MembersPage />} />
+                <Route path="*" element={<Navigate to="/agents" replace />} />
+              </Routes>
+            </motion.div>
+          </AnimatePresence>
         </main>
       </div>
     </div>

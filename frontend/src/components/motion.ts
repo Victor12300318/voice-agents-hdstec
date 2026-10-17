@@ -35,6 +35,48 @@ export const springMomentum: Transition = {
   duration: 0.4,
 }
 
+/** Studio UI spring — critically damped (stiffness 420, damping 34, mass 0.8). */
+export const springStudio: Transition = {
+  type: 'spring',
+  stiffness: 420,
+  damping: 34,
+  mass: 0.8,
+}
+
+/** Shared layoutId tab indicator spring — crisp & responsive (stiffness 450, damping 35). */
+export const springTabPill: Transition = {
+  type: 'spring',
+  stiffness: 450,
+  damping: 35,
+  mass: 0.8,
+}
+
+/** Sidebar collapse spring — continuous physical slide without jitter. */
+export const springSidebar: Transition = {
+  type: 'spring',
+  stiffness: 360,
+  damping: 32,
+}
+
+/** Live transcript bubble & Guardian badge entrance spring. */
+export const springBubble: Transition = {
+  type: 'spring',
+  stiffness: 380,
+  damping: 28,
+}
+
+/** Origin-anchored popover / dropdown transition (160ms cubic-bezier(0.22, 1, 0.36, 1)). */
+export const transitionPopover: Transition = {
+  duration: 0.16,
+  ease: [0.22, 1, 0.36, 1],
+}
+
+/** Route / tab panel entrance transition (200ms cubic-bezier(0.22, 1, 0.36, 1)). */
+export const transitionPage: Transition = {
+  duration: 0.2,
+  ease: [0.22, 1, 0.36, 1],
+}
+
 /**
  * Project the resting position of a flick, exactly like scroll deceleration.
  * Apple's exponential-decay form (NOT the textbook v^2/(2a)).

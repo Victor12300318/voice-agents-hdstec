@@ -1,4 +1,6 @@
 import { useState, useEffect } from 'react'
+import { AnimatePresence, motion } from 'motion/react'
+import { springStudio, springTabPill, transitionPopover } from './motion'
 import {
   Search,
   Wrench,
@@ -314,28 +316,31 @@ export default function ElevenToolsPanel({
               <BookOpen className="w-4 h-4 text-zinc-400" />
             </h2>
             <div className="inline-flex p-0.5 bg-zinc-100 rounded-xl border border-zinc-200/80">
-              <button
-                type="button"
-                onClick={() => setSubTab('ferramentas')}
-                className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
-                  subTab === 'ferramentas'
-                    ? 'bg-white text-zinc-900 shadow-2xs'
-                    : 'text-zinc-500 hover:text-zinc-800'
-                }`}
-              >
-                Ferramentas
-              </button>
-              <button
-                type="button"
-                onClick={() => setSubTab('mcp')}
-                className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
-                  subTab === 'mcp'
-                    ? 'bg-white text-zinc-900 shadow-2xs'
-                    : 'text-zinc-500 hover:text-zinc-800'
-                }`}
-              >
-                MCP
-              </button>
+              {(['ferramentas', 'mcp'] as const).map((tabKey) => {
+                const isActive = subTab === tabKey
+                return (
+                  <button
+                    key={tabKey}
+                    type="button"
+                    onClick={() => setSubTab(tabKey)}
+                    className={`relative px-3 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                      isActive ? 'text-zinc-900' : 'text-zinc-500 hover:text-zinc-800'
+                    }`}
+                  >
+                    {isActive && (
+                      <motion.span
+                        layoutId="agent-tools-subtab-pill"
+                        transition={springTabPill}
+                        className="absolute inset-0 rounded-lg bg-white shadow-2xs"
+                        aria-hidden="true"
+                      />
+                    )}
+                    <span className="relative z-10">
+                      {tabKey === 'ferramentas' ? 'Ferramentas' : 'MCP'}
+                    </span>
+                  </button>
+                )
+              })}
             </div>
           </div>
 
@@ -350,8 +355,16 @@ export default function ElevenToolsPanel({
               <ChevronDown className="w-3.5 h-3.5 text-zinc-300" />
             </button>
 
-            {addMenuOpen && (
-              <div className="absolute right-0 top-11 z-30 w-80 bg-white border border-zinc-200/90 rounded-2xl shadow-xl p-2 text-xs space-y-2">
+            <AnimatePresence>
+              {addMenuOpen && (
+                <motion.div
+                  key="add-tool-dropdown"
+                  initial={{ opacity: 0, scale: 0.96, y: -4 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.96, y: -2 }}
+                  transition={transitionPopover}
+                  className="absolute right-0 top-11 z-30 w-80 bg-white border border-zinc-200/90 rounded-2xl shadow-xl p-2 text-xs space-y-2 origin-top-right"
+                >
                 <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
                   Criar nova ferramenta para este agente
                 </div>
@@ -487,8 +500,9 @@ export default function ElevenToolsPanel({
                     )}
                   </div>
                 </div>
-              </div>
-            )}
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
         </div>
 
@@ -561,7 +575,7 @@ export default function ElevenToolsPanel({
                   </td>
                 </tr>
               ) : (
-                filteredTools.map((t) => {
+                filteredTools.map((t, idx) => {
                   const isGlobal = enabledToolIds.includes(t.id)
                   const inProc = referencedByProceduresToolIds.includes(t.id)
                   const execs = t.total_executions ?? 0
@@ -575,8 +589,11 @@ export default function ElevenToolsPanel({
                   }
 
                   return (
-                    <tr
+                    <motion.tr
                       key={t.id}
+                      initial={{ opacity: 0, y: 6 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ ...springStudio, delay: Math.min(idx, 12) * 0.022 }}
                       onClick={() => onEditTool && onEditTool(t)}
                       className="hover:bg-zinc-50/70 transition-colors cursor-pointer"
                     >
@@ -646,7 +663,7 @@ export default function ElevenToolsPanel({
                           </button>
                         )}
                       </td>
-                    </tr>
+                    </motion.tr>
                   )
                 })
               )}

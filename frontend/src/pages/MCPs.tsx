@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react'
+import { AnimatePresence, motion } from 'motion/react'
+import { springStudio, transitionPopover } from '../components/motion'
 import {
   BookOpen,
   Webhook,
@@ -342,11 +344,14 @@ export default function MCPsPage() {
                 </td>
               </tr>
             ) : (
-              filteredTools.map((t) => {
+              filteredTools.map((t, idx) => {
                 const isMenuOpen = openMenuId === t.id
                 return (
-                  <tr
+                  <motion.tr
                     key={t.id}
+                    initial={{ opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ ...springStudio, delay: Math.min(idx, 12) * 0.022 }}
                     onClick={() => openEditToolDrawer(t)}
                     className="group hover:bg-zinc-50/80 transition-colors cursor-pointer"
                   >
@@ -386,58 +391,67 @@ export default function MCPsPage() {
                         <MoreHorizontal className="w-4 h-4" />
                       </button>
 
-                      {isMenuOpen && (
-                        <div className="absolute right-0 top-11 z-30 w-48 bg-white border border-zinc-200/90 rounded-xl shadow-lg py-1 text-xs text-left">
-                          <button
-                            type="button"
-                            onClick={() => openEditToolDrawer(t)}
-                            className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
+                      <AnimatePresence>
+                        {isMenuOpen && (
+                          <motion.div
+                            key={`tool-menu-${t.id}`}
+                            initial={{ opacity: 0, scale: 0.96, y: -4 }}
+                            animate={{ opacity: 1, scale: 1, y: 0 }}
+                            exit={{ opacity: 0, scale: 0.96, y: -2 }}
+                            transition={transitionPopover}
+                            className="absolute right-0 top-11 z-30 w-48 bg-white border border-zinc-200/90 rounded-xl shadow-lg py-1 text-xs text-left origin-top-right"
                           >
-                            <Settings className="w-3.5 h-3.5 text-zinc-400" />
-                            Editar ferramenta
-                          </button>
+                            <button
+                              type="button"
+                              onClick={() => openEditToolDrawer(t)}
+                              className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
+                            >
+                              <Settings className="w-3.5 h-3.5 text-zinc-400" />
+                              Editar ferramenta
+                            </button>
 
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setOpenMenuId(null)
-                              const sampleObj: Record<string, any> = {}
-                              for (const p of t.input_schema || []) {
-                                sampleObj[p.name] = p.type === 'number' ? 1 : `exemplo_${p.name}`
-                              }
-                              setTestArgsJson(JSON.stringify(sampleObj, null, 2))
-                              setTestResult(null)
-                              setTestModalTool(t)
-                            }}
-                            className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
-                          >
-                            <Play className="w-3.5 h-3.5 text-zinc-400" />
-                            Testar execução
-                          </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setOpenMenuId(null)
+                                const sampleObj: Record<string, any> = {}
+                                for (const p of t.input_schema || []) {
+                                  sampleObj[p.name] = p.type === 'number' ? 1 : `exemplo_${p.name}`
+                                }
+                                setTestArgsJson(JSON.stringify(sampleObj, null, 2))
+                                setTestResult(null)
+                                setTestModalTool(t)
+                              }}
+                              className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
+                            >
+                              <Play className="w-3.5 h-3.5 text-zinc-400" />
+                              Testar execução
+                            </button>
 
-                          <button
-                            type="button"
-                            onClick={() => handleDuplicateTool(t)}
-                            className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
-                          >
-                            <Copy className="w-3.5 h-3.5 text-zinc-400" />
-                            Duplicar
-                          </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDuplicateTool(t)}
+                              className="w-full px-3.5 py-2 hover:bg-zinc-50 flex items-center gap-2 text-zinc-700 font-medium"
+                            >
+                              <Copy className="w-3.5 h-3.5 text-zinc-400" />
+                              Duplicar
+                            </button>
 
-                          <div className="my-1 border-t border-zinc-100" />
+                            <div className="my-1 border-t border-zinc-100" />
 
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteTool(t.id)}
-                            className="w-full px-3.5 py-2 hover:bg-red-50 flex items-center gap-2 text-red-600 font-medium"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            Excluir ferramenta
-                          </button>
-                        </div>
-                      )}
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteTool(t.id)}
+                              className="w-full px-3.5 py-2 hover:bg-red-50 flex items-center gap-2 text-red-600 font-medium"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              Excluir ferramenta
+                            </button>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
                     </td>
-                  </tr>
+                  </motion.tr>
                 )
               })
             )}
