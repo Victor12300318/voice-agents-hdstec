@@ -66,6 +66,7 @@ type JambonzTransport struct {
 	apiURL           string
 	apiKey           string
 	outRemainder     []byte
+	inFilterHistory  []int16
 	outFilterHistory []int16
 	writeMu          sync.Mutex
 }
@@ -100,7 +101,7 @@ func (t *JambonzTransport) ReadEvent(ctx context.Context) (runtime.TransportEven
 
 	if msgType == websocket.MessageBinary {
 		// Áudio telefônico G.711 μ-law (8kHz) vindo do Jambonz -> converte para PCM16 na taxa de entrada do Provider
-		pcm16 := audio.TelephonyToProvider(data, t.inputSampleRate)
+		pcm16 := audio.TelephonyToProviderWithHistory(data, &t.inFilterHistory, t.inputSampleRate)
 		return runtime.TransportEvent{IsAudio: true, Audio: pcm16}, nil
 	}
 

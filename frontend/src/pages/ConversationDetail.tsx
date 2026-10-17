@@ -29,6 +29,7 @@ type TimelineItem =
       timeStr: string
       relTimeStr: string
       text: string
+      trailingSpace?: boolean
     }
   | {
       kind: 'badge'
@@ -38,10 +39,20 @@ type TimelineItem =
       label: string
     }
 
+const STANDALONE_PT_WORDS = new Set([
+  'a', 'as', 'o', 'os', 'um', 'uma', 'de', 'da', 'do', 'das', 'dos', 'em', 'na', 'no', 'nas', 'nos',
+  'por', 'para', 'pra', 'pro', 'com', 'sem', 'sob', 'sobre', 'que', 'se', 'mas', 'ou', 'e', 'é',
+  'não', 'sim', 'já', 'só', 'mais', 'bem', 'bom', 'boa', 'muito', 'como', 'quando', 'onde',
+  'eu', 'tu', 'ele', 'ela', 'nós', 'você', 'vocês', 'eles', 'elas', 'me', 'te', 'se', 'lhe', 'nos',
+  'meu', 'minha', 'seu', 'sua', 'seus', 'suas', 'esse', 'essa', 'isso', 'este', 'esta', 'isto',
+  'hoje', 'agora', 'então', 'lá', 'aqui', 'aí', 'ali', 'vou', 'vai', 'foi', 'são', 'está', 'tá',
+  'tem', 'ter', 'falar', 'internet', 'dados', 'confirmados', 'encontra', 'saber', 'plano', 'gigas',
+])
+
 function appendTranscriptFragment(
   existing: string,
   fragment: string,
-  hasLeadingSpace = true,
+  hasSpaceBoundary = true,
 ): string {
   const prev = existing.trimEnd()
   const next = fragment.trim()
@@ -51,9 +62,20 @@ function appendTranscriptFragment(
   if (/^[.,!?;:)\]]/.test(next)) {
     return `${prev}${next}`
   }
-  // Se o delta do modelo veio sem espaço inicial e continua uma palavra anterior (ex: "gentile" + "za", "Tr" + "inta")
+  if (hasSpaceBoundary) {
+    return `${prev} ${next}`
+  }
+  const lastWordMatch = prev.match(/([a-záàâãéêíóôõúçA-ZÁÀÂÃÉÊÍÓÔÕÚÇ]+)$/)
+  const firstWordMatch = next.match(/^([a-záàâãéêíóôõúçA-ZÁÀÂÃÉÊÍÓÔÕÚÇ]+)/)
+  if (lastWordMatch && firstWordMatch) {
+    const lw = lastWordMatch[1].toLowerCase()
+    const fw = firstWordMatch[1].toLowerCase()
+    if (STANDALONE_PT_WORDS.has(lw) || STANDALONE_PT_WORDS.has(fw)) {
+      return `${prev} ${next}`
+    }
+  }
+  // Se o delta do modelo veio sem espaço nos dois lados e continua uma sub-palavra (ex: "gentile" + "za")
   if (
-    !hasLeadingSpace &&
     /[a-záàâãéêíóôõúçA-ZÁÀÂÃÉÊÍÓÔÕÚÇ]$/.test(prev) &&
     /^[a-záàâãéêíóôõúç]/.test(next)
   ) {
@@ -108,8 +130,15 @@ export default function ConversationDetailPage() {
         const role: 'caller' | 'agent' = ev.type === 'caller_transcript' ? 'caller' : 'agent'
         const rawOrig = String(p.text || '')
         const hasLeadingSpace = /^\s/.test(rawOrig)
+        const hasTrailingSpace = /\s$/.test(rawOrig)
         const rawText = rawOrig.trim()
-        if (!rawText) continue
+        if (!rawText) {
+          const prevItem = items[items.length - 1]
+          if (prevItem && prevItem.kind === 'message' && prevItem.role === role) {
+            prevItem.trailingSpace = true
+          }
+          continue
+        }
         if (
           role === 'agent' &&
           (/call has been terminated|call is terminated|ending the call/i.test(rawText) ||
@@ -129,7 +158,9 @@ export default function ConversationDetailPage() {
           last.role === role &&
           last.speaker === speaker
         ) {
-          last.text = appendTranscriptFragment(last.text, rawText, hasLeadingSpace)
+          const boundary = Boolean(last.trailingSpace || hasLeadingSpace)
+          last.text = appendTranscriptFragment(last.text, rawText, boundary)
+          last.trailingSpace = hasTrailingSpace
         } else {
           items.push({
             kind: 'message',
@@ -139,6 +170,7 @@ export default function ConversationDetailPage() {
             timeStr,
             relTimeStr,
             text: rawText,
+            trailingSpace: hasTrailingSpace,
           })
           forceNewBubble = false
         }

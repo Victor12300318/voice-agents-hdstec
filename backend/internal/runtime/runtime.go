@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -165,9 +164,10 @@ func (rt *Runtime) ServeWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Resolve versão: draft ou publicada
+	// 2. Resolve versão: draft, branch tip, roteamento determinístico de tráfego (latest) ou versão específica (agtvrsn_xxxx / número)
 	versionParam := strings.TrimSpace(r.URL.Query().Get("version"))
-	if versionParam == "" {
+	branchParam := strings.TrimSpace(r.URL.Query().Get("branch_id"))
+	if versionParam == "" && branchParam == "" {
 		versionParam = "draft"
 	}
 
@@ -182,25 +182,51 @@ func (rt *Runtime) ServeWS(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "erro ao carregar draft", http.StatusInternalServerError)
 			return
 		}
-	} else {
-		isTest = false
-		var v store.AgentVersion
-		if versionParam == "latest" {
-			v, err = rt.Store.LatestVersion(r.Context(), userSess.OrganizationID, agent.ID)
-		} else {
-			var num int
-			num, err = strconv.Atoi(versionParam)
-			if err == nil {
-				// Busca versão específica
-				v, err = rt.getSpecificVersion(r.Context(), userSess.OrganizationID, agent.ID, num)
+		if agent.VersioningEnabled && branchParam != "" {
+			if draftCfg, _, dErr := rt.Store.GetBranchDraft(r.Context(), userSess.OrganizationID, agent.ID, branchParam, userSess.UserID); dErr == nil && draftCfg != nil {
+				cfg = *draftCfg
+			} else if b, bErr := rt.Store.GetBranch(r.Context(), userSess.OrganizationID, agent.ID, branchParam, userSess.UserID); bErr == nil && b.HeadVersionID != nil {
+				if hv, vErr := rt.Store.GetVersionByRef(r.Context(), userSess.OrganizationID, agent.ID, *b.HeadVersionID); vErr == nil {
+					cfg = hv.Snapshot
+				}
 			}
 		}
-		if err != nil {
-			http.Error(w, "nenhuma versão publicada disponível para este agente", http.StatusUnprocessableEntity)
+	} else if branchParam != "" && (versionParam == "" || versionParam == "tip") {
+		isTest = false
+		b, bErr := rt.Store.GetBranch(r.Context(), userSess.OrganizationID, agent.ID, branchParam, userSess.UserID)
+		if bErr != nil || b.HeadVersionID == nil {
+			http.Error(w, "branch ou versão da branch não encontrada", http.StatusUnprocessableEntity)
 			return
 		}
-		versionID = &v.ID
-		cfg = v.Snapshot
+		hv, vErr := rt.Store.GetVersionByRef(r.Context(), userSess.OrganizationID, agent.ID, *b.HeadVersionID)
+		if vErr != nil {
+			http.Error(w, "versão da branch não encontrada", http.StatusUnprocessableEntity)
+			return
+		}
+		versionID = &hv.ID
+		cfg = hv.Snapshot
+	} else {
+		isTest = false
+		if versionParam == "latest" {
+			routingKey := r.URL.Query().Get("caller")
+			if routingKey == "" {
+				routingKey = time.Now().Format(time.RFC3339Nano)
+			}
+			var rErr error
+			cfg, versionID, _, rErr = rt.Store.RouteVersionForConversation(r.Context(), userSess.OrganizationID, agent, routingKey)
+			if rErr != nil || versionID == nil {
+				http.Error(w, "nenhuma versão publicada disponível para este agente", http.StatusUnprocessableEntity)
+				return
+			}
+		} else {
+			v, vErr := rt.Store.GetVersionByRef(r.Context(), userSess.OrganizationID, agent.ID, versionParam)
+			if vErr != nil {
+				http.Error(w, "nenhuma versão publicada disponível para este agente", http.StatusUnprocessableEntity)
+				return
+			}
+			versionID = &v.ID
+			cfg = v.Snapshot
+		}
 	}
 
 	// Agente precisa estar ativo para conversas não-teste

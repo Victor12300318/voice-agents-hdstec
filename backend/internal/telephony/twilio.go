@@ -108,6 +108,7 @@ type TwilioTransport struct {
 	accountSid       string
 	authToken        string
 	outRemainder     []byte
+	inFilterHistory  []int16
 	outFilterHistory []int16
 	mu               sync.RWMutex
 	writeMu          sync.Mutex
@@ -206,7 +207,7 @@ func (t *TwilioTransport) ReadEvent(ctx context.Context) (runtime.TransportEvent
 			if err != nil || len(mulawBytes) == 0 {
 				continue
 			}
-			pcm16 := audio.TelephonyToProvider(mulawBytes, t.inputSampleRate)
+			pcm16 := audio.TelephonyToProviderWithHistory(mulawBytes, &t.inFilterHistory, t.inputSampleRate)
 			return runtime.TransportEvent{IsAudio: true, Audio: pcm16}, nil
 
 		case "stop", "closed":

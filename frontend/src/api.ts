@@ -301,6 +301,71 @@ export type SystemToolsConfig = {
   guardian_jev?: GuardianJevConfig
 }
 
+export type AgentVersionSummary = {
+  id: string
+  version_id: string // agtvrsn_xxxx
+  branch_id?: string // agtbrch_xxxx
+  branch_name?: string
+  parent_version_id?: string
+  version: number
+  commit_message: string
+  published_by?: string
+  created_at: string
+}
+
+export type AgentBranch = {
+  id: string // agtbrch_xxxx
+  organization_id: string
+  agent_id: string
+  name: string
+  description: string
+  is_main: boolean
+  archived: boolean
+  traffic_percentage: number
+  parent_version_id?: string
+  head_version_id?: string
+  head_version_number?: number
+  base_main_version_id?: string
+  merged_into_branch_id?: string
+  merged_version_id?: string
+  has_draft: boolean
+  draft_updated_at?: string
+  ahead_of_main: boolean
+  behind_main: boolean
+  versions_count: number
+  versions?: AgentVersionSummary[]
+  created_at: string
+  updated_at: string
+}
+
+export type FieldDiff = {
+  field: string
+  label: string
+  target_value: any
+  source_value: any
+  resolved_value: any
+  winner?: 'source' | 'target' | 'main'
+}
+
+export type MergePreview = {
+  source_branch_id: string
+  source_branch_name: string
+  target_branch_id: string
+  target_branch_name: string
+  overridden_fields: FieldDiff[]
+  conflicts: FieldDiff[]
+  can_merge: boolean
+}
+
+export type RebasePreview = {
+  branch_id: string
+  branch_name: string
+  main_version_id: string
+  overridden_fields: FieldDiff[]
+  preserved_branch_fields: string[]
+  can_rebase: boolean
+}
+
 export type Agent = {
   id: string
   organization_id: string
@@ -323,14 +388,20 @@ export type Agent = {
   system_tools: string[]
   system_tools_config?: SystemToolsConfig
   tools: string[]
+  versioning_enabled?: boolean
   created_at: string
   updated_at: string
 }
 
 export type AgentDetail = Agent & {
   latest_version: number | null
+  latest_version_id?: string
   has_unpublished_changes: boolean
   publish_errors: string[]
+  current_branch?: AgentBranch
+  branches?: AgentBranch[]
+  viewing_version_id?: string
+  is_read_only_per_agent_settings?: boolean
 }
 
 export type AgentUpdatePayload = {
@@ -353,6 +424,7 @@ export type AgentUpdatePayload = {
   system_tools: string[]
   system_tools_config?: SystemToolsConfig
   tools: string[]
+  enable_versioning_if_not_enabled?: boolean
 }
 
 export type Conversation = {

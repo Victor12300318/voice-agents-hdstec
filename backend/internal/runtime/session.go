@@ -601,15 +601,14 @@ func (rt *Runtime) RunSessionWithOptions(
 					if callEnding.Load() {
 						continue
 					}
-					trimmedCaller := strings.TrimSpace(ev.Text)
+					normCaller := normalizeCallerTranscriptPT(ev.Text, cfg.Language)
+					trimmedCaller := strings.TrimSpace(normCaller)
 					if trimmedCaller != "" {
-						transcriptHistory = append(transcriptHistory, fmt.Sprintf("Usuário: %s", trimmedCaller))
 						guardianMu.Lock()
 						if silenceTimer != nil {
 							silenceTimer.Stop()
 						}
-						currentCallerTurnText.WriteString(" ")
-						currentCallerTurnText.WriteString(trimmedCaller)
+						appendStreamDelta(&currentCallerTurnText, normCaller)
 						lastCallerTurnText = strings.TrimSpace(currentCallerTurnText.String())
 						lastCallerTranscriptAt = time.Now()
 						callerSnapshot := lastCallerTurnText
@@ -635,8 +634,8 @@ func (rt *Runtime) RunSessionWithOptions(
 							}
 						}
 					}
-					_ = sendJSON(serverMessage{Type: "caller_transcript", Text: ev.Text})
-					_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "caller_transcript", map[string]any{"text": ev.Text})
+					_ = sendJSON(serverMessage{Type: "caller_transcript", Text: normCaller})
+					_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "caller_transcript", map[string]any{"text": normCaller})
 
 				case voice.EventAgentTranscript:
 					if callEnding.Load() {
@@ -652,9 +651,7 @@ func (rt *Runtime) RunSessionWithOptions(
 						continue
 					}
 					if strings.TrimSpace(ev.Text) != "" {
-						currentTurnAgentText.WriteString(" ")
-						currentTurnAgentText.WriteString(strings.TrimSpace(ev.Text))
-						transcriptHistory = append(transcriptHistory, fmt.Sprintf("Agente (%s): %s", cfg.Name, strings.TrimSpace(ev.Text)))
+						appendStreamDelta(&currentTurnAgentText, ev.Text)
 					}
 					_ = sendJSON(serverMessage{Type: "agent_transcript", Text: ev.Text})
 					_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "agent_transcript", map[string]any{"text": ev.Text})
@@ -759,6 +756,12 @@ func (rt *Runtime) RunSessionWithOptions(
 					guardianMu.Lock()
 					callerTurnSnapshot := strings.TrimSpace(currentCallerTurnText.String())
 					currentCallerTurnText.Reset()
+					if callerTurnSnapshot != "" {
+						transcriptHistory = append(transcriptHistory, fmt.Sprintf("Usuário: %s", callerTurnSnapshot))
+					}
+					if rawAgentTurn != "" {
+						transcriptHistory = append(transcriptHistory, fmt.Sprintf("Agente (%s): %s", cfg.Name, rawAgentTurn))
+					}
 					if len([]rune(callerTurnSnapshot)) >= 2 {
 						totalCallerTurns++
 						consecutiveAgentTurnsWithoutCaller = 0
@@ -871,14 +874,15 @@ func (rt *Runtime) RunSessionWithOptions(
 								terminate("completed", "voicemail_detected")
 								return
 							}
-							// 2. Agente Alucinando -> Corrigir em tempo real no 1º alerta; encerrar se repetir ou for severo
-							if gc.CheckHallucination && res.AgentHallucinating >= gc.HallucinationThreshold {
+							// 2. Agente Alucinando -> Corrigir silenciosamente apenas em alucinações claras do agente (>= 0.88 e severidade >= 1.5),
+							// nunca interrompendo a fala do usuário por ruído de transcrição do Caller.
+							if gc.CheckHallucination && res.AgentHallucinating >= gc.HallucinationThreshold && res.AgentHallucinating >= 0.88 && res.HallucinationSeverity >= 1.5 {
 								guardianMu.Lock()
 								hWarn := hallucinationWarnings
 								hallucinationWarnings++
 								guardianMu.Unlock()
 
-								if hWarn == 0 && res.HallucinationSeverity < 1.85 {
+								if hWarn == 0 && res.HallucinationSeverity < 1.92 {
 									_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "guardian_alert", map[string]any{
 										"kind":                   "hallucination",
 										"action":                 "correct_realtime",
@@ -887,11 +891,6 @@ func (rt *Runtime) RunSessionWithOptions(
 										"reason":                 res.Reason,
 										"model":                  res.Model,
 									})
-									hint := res.CorrectionHint
-									if hint == "" {
-										hint = res.Reason
-									}
-									_ = getProvSess().SendText(fmt.Sprintf("SISTEMA [GUARDIÃO JEV]: Alerta de alucinação/desvio detectado na sua última fala (%s). Retome imediatamente o roteiro oficial em português do Brasil e respeite estritamente as variáveis do cliente, sem inventar dados.", hint))
 								} else {
 									callEnding.Store(true)
 									_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "guardian_alert", map[string]any{
@@ -1503,24 +1502,9 @@ func (rt *Runtime) RunSessionWithOptions(
 			lastCallerSpeechEnd = time.Now()
 
 			if !ignoringCallerAudio.Load() {
-				audioToSend := ev.Audio
-				isLiveDuplex := strings.HasPrefix(strings.ToLower(strings.TrimSpace(cfg.Model)), "gpt-live")
-				if !isLiveDuplex {
-					playbackMu.Lock()
-					isAgentPlaying := time.Now().Before(agentPlaybackEndsAt)
-					playbackMu.Unlock()
-
-					// Enquanto o áudio do agente está tocando no alto-falante do telefone (isAgentPlaying),
-					// filtra apenas o eco baixo de linha/alto-falante (< 650) sem cortar o início das palavras do cliente.
-					if isAgentPlaying {
-						peak := maxAbsPCM16(ev.Audio)
-						if peak < 650 {
-							audioToSend = make([]byte, len(ev.Audio))
-						}
-					}
-				}
-
-				if err := getProvSess().SendAudio(audioToSend); err != nil {
+				// Envia o áudio do microfone/linha continuamente ao provedor sem cortar pacotes de 20ms,
+				// preservando consoantes fricativas/nasais (s, f, p, t, c, n, m) e o VAD neural nativo.
+				if err := getProvSess().SendAudio(ev.Audio); err != nil {
 					rt.Log.Warn("send_audio_to_provider_failed", "error", err)
 					terminate("failed", "provider_error")
 					break
@@ -1579,4 +1563,53 @@ func mustJSON(v any) []byte {
 		return []byte("{}")
 	}
 	return b
+}
+
+// appendStreamDelta concatena fragmentos de transcrição preservando espaços originais
+// entre tokens (seja espaço no fim do token anterior ou no início do novo token).
+func appendStreamDelta(sb *strings.Builder, delta string) {
+	if delta == "" {
+		return
+	}
+	cur := sb.String()
+	if cur == "" {
+		sb.WriteString(delta)
+		return
+	}
+	prevEndsSpace := strings.HasSuffix(cur, " ") || strings.HasSuffix(cur, "\t") || strings.HasSuffix(cur, "\n")
+	nextStartsSpace := strings.HasPrefix(delta, " ") || strings.HasPrefix(delta, "\t") || strings.HasPrefix(delta, "\n")
+	trimmedNext := strings.TrimLeft(delta, " \t\n")
+	if trimmedNext == "" {
+		if !prevEndsSpace {
+			sb.WriteString(" ")
+		}
+		return
+	}
+	if prevEndsSpace || nextStartsSpace {
+		if !prevEndsSpace {
+			sb.WriteString(" ")
+		}
+		sb.WriteString(trimmedNext)
+		return
+	}
+	sb.WriteString(delta)
+}
+
+// normalizeCallerTranscriptPT corrige homófonos curtos que modelos multilíngues em 8kHz
+// transcrevem em espanhol/inglês/alemão quando o idioma da chamada é Português (pt-BR).
+func normalizeCallerTranscriptPT(text, lang string) string {
+	l := strings.ToLower(strings.TrimSpace(lang))
+	if l != "" && !strings.HasPrefix(l, "pt") {
+		return text
+	}
+	trimmed := strings.TrimSpace(text)
+	switch strings.ToLower(trimmed) {
+	case "¿sí?", "sí?", "sí.", "sí", "si.", "si?":
+		return "Sim."
+	case "ja.", "ja!", "ja":
+		return "Já."
+	case "now.", "now!", "now":
+		return "Não."
+	}
+	return text
 }

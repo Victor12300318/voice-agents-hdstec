@@ -96,7 +96,16 @@ func ResamplePCM16WithHistory(input []byte, history *[]int16, inRate, outRate in
 	totalLen := len(inSamples)
 
 	for i := 0; i < numOutSamples; i++ {
-		pos := float64(histLen) + float64(i)*step
+		var pos float64
+		if len(kernel) > 0 {
+			pos = float64(histLen) + float64(i)*step
+		} else if histLen > 0 {
+			// No upsampling com histórico (1 amostra anterior em inSamples[0]), interpola continuamente
+			// desde a fronteira do chunk anterior sem repetir a última amostra.
+			pos = float64(histLen-1) + float64(i+1)*step
+		} else {
+			pos = float64(i) * step
+		}
 
 		var sample int16
 		if len(kernel) > 0 {
@@ -138,8 +147,11 @@ func ResamplePCM16WithHistory(input []byte, history *[]int16, inRate, outRate in
 		binary.LittleEndian.PutUint16(out[i*2:], uint16(sample))
 	}
 
-	if history != nil && len(kernel) > 0 {
+	if history != nil {
 		keep := len(kernel)
+		if keep == 0 {
+			keep = 1
+		}
 		if totalLen > keep {
 			*history = append((*history)[:0], inSamples[totalLen-keep:]...)
 		} else {
@@ -150,33 +162,19 @@ func ResamplePCM16WithHistory(input []byte, history *[]int16, inRate, outRate in
 	return out
 }
 
-// boostCallerSpeechPCM16 aplica ganho vocal linear (+6 dB / 2.0x) com atenuação de ruído de fundo
-// no áudio de entrada telefônico (G.711 μ-law). Mantém a onda 100% linear na faixa da fala para não
-// distorcer números/vogais no ASR e reduz o piso de ruído da linha (< 220) pela metade.
+// boostCallerSpeechPCM16 aplica ganho linear limpo (1.15x) sem gate nem joelho não-linear,
+// preservando 100% das consoantes fricativas/nasais (s, f, t, p, c, n, m) para o ASR.
 func boostCallerSpeechPCM16(pcm []byte) []byte {
 	numSamples := len(pcm) / 2
 	for i := 0; i < numSamples; i++ {
 		raw := int16(binary.LittleEndian.Uint16(pcm[i*2:]))
-		absVal := float64(raw)
-		sign := 1.0
-		if absVal < 0 {
-			absVal = -absVal
-			sign = -1.0
-		}
-
-		var boosted float64
-		if absVal <= 220 {
-			// Atenua ruído de linha/eco baixo em 50% durante silêncio
-			boosted = absVal * 0.5
-		} else {
-			// Ganho linear limpo de 2.0x (+6 dB) sem distorção harmônica
-			boosted = 110 + (absVal-220)*2.0
-		}
-
+		boosted := float64(raw) * 1.15
 		if boosted > 32600 {
 			boosted = 32600
+		} else if boosted < -32600 {
+			boosted = -32600
 		}
-		outSample := int16(math.Round(sign * boosted))
+		outSample := int16(math.Round(boosted))
 		binary.LittleEndian.PutUint16(pcm[i*2:], uint16(outSample))
 	}
 	return pcm
@@ -184,11 +182,16 @@ func boostCallerSpeechPCM16(pcm []byte) []byte {
 
 // TelephonyToProvider converte áudio telefônico G.711 μ-law (8kHz) para PCM16 na taxa de entrada do modelo (16kHz ou 24kHz).
 func TelephonyToProvider(muLaw8k []byte, providerInputSampleRate int) []byte {
+	return TelephonyToProviderWithHistory(muLaw8k, nil, providerInputSampleRate)
+}
+
+// TelephonyToProviderWithHistory converte áudio telefônico G.711 μ-law (8kHz) para PCM16 mantendo continuidade entre pacotes de 20ms.
+func TelephonyToProviderWithHistory(muLaw8k []byte, history *[]int16, providerInputSampleRate int) []byte {
 	pcm8k := boostCallerSpeechPCM16(DecodeMuLaw(muLaw8k))
 	if providerInputSampleRate == 8000 {
 		return pcm8k
 	}
-	return ResamplePCM16(pcm8k, 8000, providerInputSampleRate)
+	return ResamplePCM16WithHistory(pcm8k, history, 8000, providerInputSampleRate)
 }
 
 // ProviderToTelephony converte áudio PCM16 retornado pelo modelo de IA (24kHz) para G.711 μ-law (8kHz).

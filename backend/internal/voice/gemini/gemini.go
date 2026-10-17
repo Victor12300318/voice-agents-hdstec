@@ -99,12 +99,23 @@ func (p *Provider) Connect(ctx context.Context, cfg voice.SessionConfig) (voice.
 	if p.client == nil {
 		return nil, errors.New("GEMINI_API_KEY não configurada")
 	}
+	sysPrompt := cfg.SystemPrompt
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(cfg.Language)), "pt") || cfg.Language == "" {
+		sysPrompt += "\n\nATENÇÃO DE ÁUDIO E ESCUTA (PT-BR): O usuário está falando EXCLUSIVAMENTE em Português do Brasil (pt-BR) em uma ligação telefônica. Interprete todas as falas curtas em português do Brasil (ex: 'Sim', 'Não', 'Pode sim', 'Já', 'Dá conta', 'WhatsApp', dígitos numéricos). Nunca interprete respostas curtas como espanhol ('¿Sí?'), inglês ('Now', 'boxing') ou alemão ('Ja')."
+	}
+	langCode := strings.TrimSpace(cfg.Language)
+	if langCode == "" {
+		langCode = "pt-BR"
+	}
 	conf := &genai.LiveConnectConfig{
 		ResponseModalities: []genai.Modality{genai.ModalityAudio},
-		SpeechConfig: &genai.SpeechConfig{VoiceConfig: &genai.VoiceConfig{
-			PrebuiltVoiceConfig: &genai.PrebuiltVoiceConfig{VoiceName: cfg.Voice},
-		}},
-		SystemInstruction:        &genai.Content{Parts: []*genai.Part{{Text: cfg.SystemPrompt}}},
+		SpeechConfig: &genai.SpeechConfig{
+			LanguageCode: langCode,
+			VoiceConfig: &genai.VoiceConfig{
+				PrebuiltVoiceConfig: &genai.PrebuiltVoiceConfig{VoiceName: cfg.Voice},
+			},
+		},
+		SystemInstruction:        &genai.Content{Parts: []*genai.Part{{Text: sysPrompt}}},
 		InputAudioTranscription:  &genai.AudioTranscriptionConfig{},
 		OutputAudioTranscription: &genai.AudioTranscriptionConfig{},
 	}

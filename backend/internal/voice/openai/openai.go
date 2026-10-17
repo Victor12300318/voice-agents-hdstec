@@ -196,14 +196,15 @@ func (p *Provider) Connect(ctx context.Context, cfg voice.SessionConfig) (voice.
 						"rate": 24000,
 					},
 					"transcription": map[string]any{
-						"model":    "gpt-4o-mini-transcribe",
+						"model":    "gpt-4o-transcribe",
 						"language": langCode,
+						"prompt":   "Conversa telefônica em português do Brasil (pt-BR). Palavras frequentes: Sim, Não, Pode sim, Já, Tudo bem, Trabalho, Dia a dia, WhatsApp, Redes sociais, CPF, Gigas, Internet, Plano, TIM.",
 					},
 					"turn_detection": map[string]any{
 						"type":                "server_vad",
-						"threshold":           0.5,
+						"threshold":           0.55,
 						"prefix_padding_ms":   300,
-						"silence_duration_ms": 550,
+						"silence_duration_ms": 500,
 						"create_response":     true,
 						"interrupt_response":  true,
 					},
@@ -254,6 +255,9 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 	livePrompt := cfg.SystemPrompt
 	if len(livePrompt) > 28000 {
 		livePrompt = livePrompt[:28000]
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(cfg.Language)), "pt") || cfg.Language == "" {
+		livePrompt += "\n\nATENÇÃO DE ESCUTA E TRANSCRIÇÃO (PT-BR): O cliente está falando EXCLUSIVAMENTE em Português do Brasil (pt-BR) por telefone. Interprete todas as respostas curtas em português do Brasil (ex: 'Sim', 'Não', 'Pode sim', 'Já', 'Dá conta', 'WhatsApp', dígitos de CPF). Jamais transcreva em espanhol ('¿Sí?'), inglês ('Now', 'boxing') ou alemão ('Ja')."
 	}
 	if len(cfg.Tools) > 0 {
 		livePrompt += "\n\nQuando precisar executar qualquer ferramenta (como encerrar_conversa, transfer_to_agent ou webhooks), delegue imediatamente ao backend."
@@ -351,6 +355,8 @@ type openAILiveSession struct {
 	silentTailSent atomic.Int32
 	turnTimer      *time.Timer
 	speechTimer    *time.Timer
+	prevInSample   int32
+	hasPrevSample  bool
 }
 
 func isAudiblePCM16(pcm []byte) bool {
@@ -406,7 +412,9 @@ func (s *openAILiveSession) silenceKeepaliveLoop() {
 }
 
 func (s *openAILiveSession) SendAudio(pcm16k []byte) error {
-	pcm24k := upsample16to24Bytes(pcm16k)
+	s.mu.Lock()
+	pcm24k := upsample16to24Stateful(pcm16k, &s.prevInSample, &s.hasPrevSample)
+	s.mu.Unlock()
 	if len(pcm24k) == 0 {
 		return nil
 	}
@@ -609,16 +617,25 @@ func (s *openAILiveSession) dispatch(data []byte) {
 // ============================================================================
 
 type openAISession struct {
-	conn    *websocket.Conn
-	events  chan voice.Event
-	writeMu sync.Mutex
-	mu      sync.Mutex
-	closed  bool
+	conn          *websocket.Conn
+	events        chan voice.Event
+	writeMu       sync.Mutex
+	mu            sync.Mutex
+	closed        bool
+	prevInSample  int32
+	hasPrevSample bool
 }
 
-// upsample16to24Bytes converte PCM16 LE de 16000 Hz para 24000 Hz (razão 2 -> 3)
-// exigido pelo OpenAI Realtime e GPT-Live (`audio/pcm` rate 24000).
+// upsample16to24Bytes converte PCM16 LE de 16000 Hz para 24000 Hz (razão 2 -> 3).
 func upsample16to24Bytes(pcm16k []byte) []byte {
+	var prev int32
+	var hasPrev bool
+	return upsample16to24Stateful(pcm16k, &prev, &hasPrev)
+}
+
+// upsample16to24Stateful converte PCM16 LE de 16000 Hz para 24000 Hz preservando a última amostra
+// do chunk anterior (sPrev) para espaçamento exato de 2/3 sem descontinuidade nas fronteiras de pacote.
+func upsample16to24Stateful(pcm16k []byte, prevSample *int32, hasPrev *bool) []byte {
 	num16 := len(pcm16k) / 2
 	if num16 == 0 {
 		return nil
@@ -628,23 +645,31 @@ func upsample16to24Bytes(pcm16k []byte) []byte {
 		return pcm16k
 	}
 	out := make([]byte, numPairs*3*2)
+	sPrev := int32(0)
+	if prevSample != nil && hasPrev != nil && *hasPrev {
+		sPrev = *prevSample
+	} else {
+		sPrev = int32(int16(binary.LittleEndian.Uint16(pcm16k[0:])))
+	}
+
 	for i := 0; i < numPairs; i++ {
 		s0 := int32(int16(binary.LittleEndian.Uint16(pcm16k[(i*2)*2:])))
 		s1 := int32(int16(binary.LittleEndian.Uint16(pcm16k[(i*2+1)*2:])))
-		var s2 int32
-		if i*2+2 < num16 {
-			s2 = int32(int16(binary.LittleEndian.Uint16(pcm16k[(i*2+2)*2:])))
-		} else {
-			s2 = s1
-		}
-		o0 := int16(s0)
-		o1 := int16((s0 + 2*s1) / 3)
-		o2 := int16((2*s1 + s2) / 3)
+
+		o0 := int16((sPrev + 2*s0) / 3)
+		o1 := int16((2*s0 + s1) / 3)
+		o2 := int16(s1)
+		sPrev = s1
 
 		base := i * 3 * 2
 		binary.LittleEndian.PutUint16(out[base:], uint16(o0))
 		binary.LittleEndian.PutUint16(out[base+2:], uint16(o1))
 		binary.LittleEndian.PutUint16(out[base+4:], uint16(o2))
+	}
+
+	if prevSample != nil && hasPrev != nil {
+		*prevSample = sPrev
+		*hasPrev = true
 	}
 	return out
 }
@@ -662,7 +687,9 @@ func (s *openAISession) writeJSON(v any) error {
 }
 
 func (s *openAISession) SendAudio(pcm16k []byte) error {
-	pcm24k := upsample16to24Bytes(pcm16k)
+	s.mu.Lock()
+	pcm24k := upsample16to24Stateful(pcm16k, &s.prevInSample, &s.hasPrevSample)
+	s.mu.Unlock()
 	if len(pcm24k) == 0 {
 		return nil
 	}

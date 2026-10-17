@@ -14,10 +14,13 @@ type TranscriptMessage = {
   role: 'caller' | 'agent' | 'system'
   text: string
   timestamp: string
+  trailingSpace?: boolean
 }
 
 type VersionSummary = {
   version: number
+  version_id?: string
+  branch_name?: string
   created_at: string
 }
 
@@ -35,8 +38,9 @@ export default function AgentTest() {
   const [transcripts, setTranscripts] = useState<TranscriptMessage[]>([])
   const [errorMsg, setErrorMsg] = useState<string>('')
   const [isMuted, setIsMuted] = useState<boolean>(false)
-  const [antiEcho, setAntiEcho] = useState<boolean>(true)
+  const [antiEcho, setAntiEcho] = useState<boolean>(false)
   const [resolvedVars, setResolvedVars] = useState<Record<string, string> | null>(null)
+  const forceNewBubbleRef = useRef<boolean>(false)
 
   // Volumes em tempo real para os visualizadores da ElevenLabs
   const [callerVolume, setCallerVolume] = useState<number>(0)
@@ -72,17 +76,31 @@ export default function AgentTest() {
   }, [transcripts])
 
   const addMessage = (role: 'caller' | 'agent' | 'system', text: string) => {
-    const frag = String(text).trim()
+    const rawOrig = String(text || '')
+    const hasLeadingSpace = /^\s/.test(rawOrig)
+    const hasTrailingSpace = /\s$/.test(rawOrig)
+    const frag = rawOrig.trim()
     if (!frag) return
     setTranscripts((prev) => {
       const last = prev[prev.length - 1]
-      if (role !== 'system' && last && last.role === role) {
-        const sep = /^[.,!?;:]/.test(frag) ? '' : ' '
+      if (!forceNewBubbleRef.current && role !== 'system' && last && last.role === role) {
+        const isPunct = /^[.,!?;:]/.test(frag)
+        const needsSpace =
+          !isPunct &&
+          (last.trailingSpace ||
+            hasLeadingSpace ||
+            !/[a-záàâãéêíóôõúçA-ZÁÀÂÃÉÊÍÓÔÕÚÇ]$/.test(last.text) ||
+            !/^[a-záàâãéêíóôõúç]/.test(frag))
         return [
           ...prev.slice(0, -1),
-          { ...last, text: `${last.text.trimEnd()}${sep}${frag}` },
+          {
+            ...last,
+            text: `${last.text.trimEnd()}${needsSpace ? ' ' : ''}${frag}`,
+            trailingSpace: hasTrailingSpace,
+          },
         ]
       }
+      forceNewBubbleRef.current = false
       return [
         ...prev,
         {
@@ -90,6 +108,7 @@ export default function AgentTest() {
           role,
           text: frag,
           timestamp: new Date().toLocaleTimeString('pt-BR'),
+          trailingSpace: hasTrailingSpace,
         },
       ]
     })
@@ -392,9 +411,10 @@ export default function AgentTest() {
               className="px-3 py-2 bg-white border border-zinc-200 rounded-lg text-xs text-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 disabled:opacity-50"
             >
               <option value="draft">Draft (Rascunho atual)</option>
+              <option value="latest">Roteamento de Tráfego (Produção / Branches)</option>
               {versions.map((v) => (
-                <option key={v.version} value={String(v.version)}>
-                  v{v.version} ({new Date(v.created_at).toLocaleDateString('pt-BR')})
+                <option key={v.version_id || v.version} value={v.version_id || String(v.version)}>
+                  v{v.version} {v.version_id ? `(${v.version_id})` : ''} {v.branch_name ? `• ${v.branch_name}` : ''}
                 </option>
               ))}
             </select>

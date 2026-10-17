@@ -9,12 +9,14 @@ import NotionProcedureWorkspace from '../components/NotionProcedureWorkspace'
 import { RichPromptCard, SYSTEM_VARIABLES_CATALOG } from '../components/VariablesPopoverModal'
 import ElevenToolsPanel from '../components/ElevenToolsPanel'
 import ElevenToolDrawer, { type ToolCategory } from '../components/ElevenToolDrawer'
+import AgentVersioningPanel from '../components/AgentVersioningPanel'
 import { AnimatePresence, motion } from 'motion/react'
 import { haptic, springTabPill, transitionPage } from '../components/motion'
 import {
   api,
   type AgentDetail,
   type AgentUpdatePayload,
+  type AgentVersionSummary,
   type Skill,
   type ToolWithStats,
   type KnowledgeBase,
@@ -35,7 +37,6 @@ import {
   Search,
   UserCircle2,
   ListTree,
-  GitFork,
   GitBranch,
   FolderOpen,
   BarChart2,
@@ -331,7 +332,9 @@ export default function AgentEditor() {
   const [availableTools, setAvailableTools] = useState<ToolWithStats[]>([])
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([])
   const [agentConversations, setAgentConversations] = useState<Conversation[]>([])
-  const [versionsList, setVersionsList] = useState<{ version: number; created_at: string }[]>([])
+  const [versionsList, setVersionsList] = useState<AgentVersionSummary[]>([])
+  const [activeBranchId, setActiveBranchId] = useState<string>('Main')
+  const [viewingVersionId, setViewingVersionId] = useState<string | null>(null)
 
   // Navegação & Sidebar (Expandida igual à Imagem 2 ou Recolhida em Ícones igual à Imagem 1)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
@@ -398,7 +401,7 @@ export default function AgentEditor() {
   const [executedTools, setExecutedTools] = useState<
     { name: string; latencyMs: number; status: string }[]
   >([])
-  const [antiEcho, setAntiEcho] = useState(true)
+  const [antiEcho, setAntiEcho] = useState(false)
   const [isMicMuted, setIsMicMuted] = useState(false)
   const [isAgentSpeaking, setIsAgentSpeaking] = useState(false)
 
@@ -408,21 +411,30 @@ export default function AgentEditor() {
   const timerRef = useRef<any>(null)
   const transcriptsEndRef = useRef<HTMLDivElement | null>(null)
 
-  const loadData = async () => {
+  const loadData = async (branchOverride?: string, versionOverride?: string | null) => {
     try {
+      const targetBranch = branchOverride ?? activeBranchId
+      const targetVersion = versionOverride !== undefined ? versionOverride : viewingVersionId
+      const agentQuery = new URLSearchParams()
+      if (targetBranch) agentQuery.set('branch_id', targetBranch)
+      if (targetVersion) agentQuery.set('version_id', targetVersion)
+
       const [cats, ag, tls, procs, kbs, vers] = await Promise.all([
         api<ProviderCatalog[]>('/api/providers').catch(() => FALLBACK_CATALOGS),
-        api<AgentDetail>(`/api/agents/${id}`),
+        api<AgentDetail>(`/api/agents/${id}?${agentQuery.toString()}`),
         api<ToolWithStats[]>('/api/tools').catch(() => []),
         api<Skill[]>(`/api/agents/${id}/procedures`).catch(() => []),
         api<KnowledgeBase[]>('/api/knowledge-bases').catch(() => []),
-        api<{ version: number; created_at: string }[]>(`/api/agents/${id}/versions`).catch(
+        api<AgentVersionSummary[]>(`/api/agents/${id}/versions`).catch(
           () => [],
         ),
       ])
 
       setCatalogs(cats.length ? cats : FALLBACK_CATALOGS)
       setDetail(ag)
+      if (ag.current_branch?.id && !branchOverride) {
+        setActiveBranchId(ag.current_branch.id)
+      }
       setAvailableTools(tls || [])
       setSkills(procs || [])
       setKnowledgeBases(kbs || [])
@@ -513,7 +525,10 @@ export default function AgentEditor() {
       const syncedVars = syncReferencedVariables(merged)
       const payload = { ...merged, variables: syncedVars }
       setForm(payload)
-      const updated = await api<AgentDetail>(`/api/agents/${id}`, {
+      const branchQuery = detail?.versioning_enabled && activeBranchId
+        ? `?branch_id=${encodeURIComponent(activeBranchId)}`
+        : ''
+      const updated = await api<AgentDetail>(`/api/agents/${id}${branchQuery}`, {
         method: 'PUT',
         body: JSON.stringify(payload),
       })
@@ -529,26 +544,37 @@ export default function AgentEditor() {
     }
   }
 
-  const handlePublish = async () => {
+  const handlePublishToBranch = async (branchId?: string, commitMsg?: string) => {
     if (!id || !form) return
     setPublishing(true)
     setMessage(null)
     try {
+      const targetBranch = branchId || activeBranchId || 'Main'
       const syncedVars = syncReferencedVariables(form)
       const payload = { ...form, variables: syncedVars }
       setForm(payload)
-      await api(`/api/agents/${id}`, {
+      const branchQuery = detail?.versioning_enabled && targetBranch
+        ? `?branch_id=${encodeURIComponent(targetBranch)}`
+        : ''
+      await api(`/api/agents/${id}${branchQuery}`, {
         method: 'PUT',
         body: JSON.stringify(payload),
       })
-      await api(`/api/agents/${id}/publish`, { method: 'POST' })
+      const pubRes = await api<{ version: number; version_id?: string }>(`/api/agents/${id}/publish`, {
+        method: 'POST',
+        body: JSON.stringify({
+          branch_id: detail?.versioning_enabled ? targetBranch : '',
+          commit_message: commitMsg || 'Nova versão publicada',
+        }),
+      })
       haptic(12)
       setHasUnsavedDraft(false)
+      setViewingVersionId(null)
       setMessage({
         type: 'success',
-        text: 'Nova versão publicada com sucesso!',
+        text: `Nova versão v${pubRes.version}${pubRes.version_id ? ` (${pubRes.version_id})` : ''} publicada com sucesso!`,
       })
-      await loadData()
+      await loadData(targetBranch, null)
     } catch (err: any) {
       setMessage({
         type: 'error',
@@ -557,6 +583,10 @@ export default function AgentEditor() {
     } finally {
       setPublishing(false)
     }
+  }
+
+  const handlePublish = async () => {
+    await handlePublishToBranch(activeBranchId, 'Nova versão publicada')
   }
 
   const handleProviderChange = (newProv: string) => {
@@ -736,7 +766,10 @@ export default function AgentEditor() {
       playerRef.current = player
 
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const wsUrl = `${proto}//${window.location.host}/ws/conversations/${id}?version=draft&caller=preview_panel`
+      const branchQuery = detail?.versioning_enabled && activeBranchId
+        ? `&branch_id=${encodeURIComponent(activeBranchId)}`
+        : ''
+      const wsUrl = `${proto}//${window.location.host}/ws/conversations/${id}?version=draft${branchQuery}&caller=preview_panel`
       const ws = new WebSocket(wsUrl)
       ws.binaryType = 'arraybuffer'
       wsRef.current = ws
@@ -756,12 +789,18 @@ export default function AgentEditor() {
               await rec.start(data.input_sample_rate || 16000)
               recorderRef.current = rec
             } else if (data.type === 'caller_transcript' && data.text) {
-              const frag = String(data.text).trim()
+              const rawOrig = String(data.text)
+              const hasLeading = /^\s/.test(rawOrig)
+              const frag = rawOrig.trim()
               if (frag) {
                 setTranscripts((prev) => {
                   const last = prev[prev.length - 1]
                   if (last && last.role === 'caller') {
-                    const sep = /^[.,!?;:]/.test(frag) ? '' : ' '
+                    const isPunct = /^[.,!?;:]/.test(frag)
+                    const sep =
+                      isPunct || (!hasLeading && /[a-záàâãéêíóôõúç]$/i.test(last.text) && /^[a-záàâãéêíóôõúç]/.test(frag))
+                        ? ''
+                        : ' '
                     return [
                       ...prev.slice(0, -1),
                       { ...last, text: `${last.text.trimEnd()}${sep}${frag}` },
@@ -779,12 +818,18 @@ export default function AgentEditor() {
                 })
               }
             } else if (data.type === 'agent_transcript' && data.text) {
-              const frag = String(data.text).trim()
+              const rawOrig = String(data.text)
+              const hasLeading = /^\s/.test(rawOrig)
+              const frag = rawOrig.trim()
               if (frag) {
                 setTranscripts((prev) => {
                   const last = prev[prev.length - 1]
                   if (last && last.role === 'agent') {
-                    const sep = /^[.,!?;:]/.test(frag) ? '' : ' '
+                    const isPunct = /^[.,!?;:]/.test(frag)
+                    const sep =
+                      isPunct || (!hasLeading && /[a-záàâãéêíóôõúç]$/i.test(last.text) && /^[a-záàâãéêíóôõúç]/.test(frag))
+                        ? ''
+                        : ' '
                     return [
                       ...prev.slice(0, -1),
                       { ...last, text: `${last.text.trimEnd()}${sep}${frag}` },
@@ -1107,6 +1152,30 @@ export default function AgentEditor() {
             </button>
 
             <span className="text-xs font-semibold text-zinc-900">{form.name}</span>
+
+            {detail?.versioning_enabled && detail.branches && detail.branches.length > 0 && (
+              <div className="inline-flex items-center gap-1.5 ml-1">
+                <select
+                  value={activeBranchId}
+                  onChange={async (e) => {
+                    const nextBranch = e.target.value
+                    setActiveBranchId(nextBranch)
+                    setViewingVersionId(null)
+                    await loadData(nextBranch, null)
+                  }}
+                  title="Selecionar branch ativa do agente"
+                  className="px-2.5 py-1 rounded-lg bg-zinc-100 hover:bg-zinc-200/70 border border-zinc-200/90 text-[11px] font-semibold text-zinc-800 cursor-pointer"
+                >
+                  {detail.branches
+                    .filter((b) => !b.archived || b.id === activeBranchId)
+                    .map((b) => (
+                      <option key={b.id} value={b.id}>
+                        Branch: {b.name} ({b.traffic_percentage}%)
+                      </option>
+                    ))}
+                </select>
+              </div>
+            )}
 
             <button
               type="button"
@@ -1610,55 +1679,30 @@ export default function AgentEditor() {
             </div>
           )}
 
-          {/* SEÇÃO: CONTROLE DE VERSÃO */}
-          {currentTab === 'versoes' && (
-            <div className="max-w-4xl mx-auto px-6 sm:px-10 py-8 space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h2 className="text-xl font-bold text-zinc-900">Controle de versão</h2>
-                  <p className="text-xs text-zinc-500 mt-0.5">
-                    Histórico imutável de snapshots publicados deste agente e seus procedimentos.
-                  </p>
-                </div>
-                <Button size="sm" onClick={handlePublish} disabled={publishing}>
-                  Publicar versão agora
-                </Button>
-              </div>
-
-              <div className="bg-white border border-zinc-200 rounded-2xl divide-y divide-zinc-100 text-xs">
-                <div className="p-4 flex items-center justify-between bg-amber-50/40">
-                  <div className="flex items-center gap-2.5">
-                    <span className="w-2.5 h-2.5 rounded-full bg-amber-500" />
-                    <div>
-                      <span className="font-semibold text-zinc-900">Draft atual (Main)</span>
-                      <p className="text-[11px] text-zinc-500">
-                        Versão editável usada na Pré-visualização
-                      </p>
-                    </div>
-                  </div>
-                  <span className="px-2.5 py-0.5 rounded-full bg-amber-100 text-amber-800 font-medium text-[11px]">
-                    Em edição
-                  </span>
-                </div>
-
-                {versionsList.map((v) => (
-                  <div key={v.version} className="p-4 flex items-center justify-between">
-                    <div className="flex items-center gap-2.5">
-                      <GitFork className="w-4 h-4 text-zinc-400" />
-                      <div>
-                        <span className="font-semibold text-zinc-900">Versão v{v.version}</span>
-                        <p className="text-[11px] text-zinc-500">
-                          Publicada em {new Date(v.created_at).toLocaleString('pt-BR')}
-                        </p>
-                      </div>
-                    </div>
-                    <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-medium text-[11px]">
-                      Snapshot imutável
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
+          {/* SEÇÃO: CONTROLE DE VERSÃO (ELEVENLABS AGENT VERSIONING) */}
+          {currentTab === 'versoes' && detail && (
+            <AgentVersioningPanel
+              agent={detail}
+              versions={versionsList}
+              activeBranchId={activeBranchId}
+              viewingVersionId={viewingVersionId}
+              publishing={publishing}
+              onSelectBranch={async (bId) => {
+                setActiveBranchId(bId)
+                setViewingVersionId(null)
+                await loadData(bId, null)
+              }}
+              onSelectVersion={async (vId) => {
+                setViewingVersionId(vId)
+                await loadData(activeBranchId, vId)
+              }}
+              onPublishToBranch={async (bId, msg) => {
+                await handlePublishToBranch(bId, msg)
+              }}
+              onRefresh={async () => {
+                await loadData(activeBranchId, viewingVersionId)
+              }}
+            />
           )}
 
           {/* SEÇÃO: BASE DE CONHECIMENTO */}
@@ -1880,6 +1924,40 @@ export default function AgentEditor() {
                       label="Gravar chamadas"
                     />
                   </div>
+                </div>
+
+                <div className="pt-4 border-t border-zinc-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <span className="font-semibold text-zinc-900 block">
+                      Controle de Versão do Agente (Branches & Divisão de Tráfego)
+                    </span>
+                    <span className="text-[11px] text-zinc-500">
+                      {detail?.versioning_enabled
+                        ? 'Controle de versão habilitado permanentemente neste agente (Main + branches isoladas).'
+                        : 'Habilite branches isoladas, versões imutáveis (agtvrsn_xxxx) e divisão de tráfego (100%). Uma vez habilitado, não pode ser desabilitado.'}
+                    </span>
+                  </div>
+                  {detail?.versioning_enabled ? (
+                    <button
+                      type="button"
+                      onClick={() => setCurrentTab('versoes')}
+                      className="px-3 py-1.5 rounded-xl bg-zinc-100 hover:bg-zinc-200/80 text-zinc-900 font-semibold text-xs whitespace-nowrap cursor-pointer"
+                    >
+                      Gerenciar Branches →
+                    </button>
+                  ) : (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={async () => {
+                        await api(`/api/agents/${id}/versioning/enable`, { method: 'POST' })
+                        await loadData('Main', null)
+                        setCurrentTab('versoes')
+                      }}
+                    >
+                      Habilitar Controle de Versão
+                    </Button>
+                  )}
                 </div>
 
                 <div className="pt-3 border-t border-zinc-100 flex justify-end">

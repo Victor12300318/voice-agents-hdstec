@@ -44,12 +44,13 @@ export class AudioRecorder {
       const out = e.outputBuffer.getChannelData(0)
       out.fill(0)
 
-      if (this.isMuted) {
-        return
-      }
-
       const input = e.inputBuffer.getChannelData(0)
       const resampled = downsample(input, inputRate, targetSampleRate)
+      if (this.isMuted) {
+        const silent = new Int16Array(resampled.length)
+        this.onAudioChunk(silent.buffer as ArrayBuffer)
+        return
+      }
       const pcm16 = floatTo16BitPCM(resampled)
       this.onAudioChunk(pcm16.buffer as ArrayBuffer)
     }
@@ -261,9 +262,8 @@ function downsample(buffer: Float32Array, inputRate: number, outputRate: number)
 function floatTo16BitPCM(input: Float32Array): Int16Array {
   const output = new Int16Array(input.length)
   for (let i = 0; i < input.length; i++) {
-    // Ganho vocal de 1.8x com soft-limiting (tanh) para que microfones baixos cheguem claros ao modelo e na gravação
-    const boosted = Math.tanh(input[i] * 1.8)
-    const s = Math.max(-1, Math.min(1, boosted))
+    // Conversão linear pura (sem saturação harmônica tanh) para preservar consoantes e cancelamento de eco WebRTC
+    const s = Math.max(-1, Math.min(1, input[i]))
     output[i] = s < 0 ? s * 0x8000 : s * 0x7fff
   }
   return output

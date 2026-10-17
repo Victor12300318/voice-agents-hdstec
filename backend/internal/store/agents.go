@@ -29,13 +29,14 @@ type Agent struct {
 	SystemTools               json.RawMessage `json:"system_tools"`
 	SystemToolsConfig         json.RawMessage `json:"system_tools_config"`
 	Tools                     json.RawMessage `json:"tools"`
+	VersioningEnabled         bool            `json:"versioning_enabled"`
 	CreatedAt                 time.Time       `json:"created_at"`
 	UpdatedAt                 time.Time       `json:"updated_at"`
 }
 
 const agentCols = `id, organization_id, name, description, active, provider, model, voice, language, timezone,
 	system_prompt, first_message, first_message_interruptible, max_duration_seconds, recording_enabled,
-	variables, initiation_webhook_url, initiation_webhook_timeout_ms, system_tools, system_tools_config, tools, created_at, updated_at`
+	variables, initiation_webhook_url, initiation_webhook_timeout_ms, system_tools, system_tools_config, tools, versioning_enabled, created_at, updated_at`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -44,7 +45,7 @@ func scanAgent(r scanner) (Agent, error) {
 	err := r.Scan(&a.ID, &a.OrganizationID, &a.Name, &a.Description, &a.Active, &a.Provider, &a.Model,
 		&a.Voice, &a.Language, &a.Timezone, &a.SystemPrompt, &a.FirstMessage, &a.FirstMessageInterruptible,
 		&a.MaxDurationSeconds, &a.RecordingEnabled, &a.Variables, &a.InitiationWebhookURL,
-		&a.InitiationWebhookTimeout, &a.SystemTools, &a.SystemToolsConfig, &a.Tools, &a.CreatedAt, &a.UpdatedAt)
+		&a.InitiationWebhookTimeout, &a.SystemTools, &a.SystemToolsConfig, &a.Tools, &a.VersioningEnabled, &a.CreatedAt, &a.UpdatedAt)
 	return a, err
 }
 

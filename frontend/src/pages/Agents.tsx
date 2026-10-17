@@ -24,6 +24,7 @@ export default function Agents() {
   const [me, setMe] = useState<Me | null>(null)
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
+  const [enableVersioning, setEnableVersioning] = useState(false)
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'inactive'>('all')
   const [providerFilter, setProviderFilter] = useState<'all' | 'gemini' | 'openai'>('all')
@@ -61,7 +62,11 @@ export default function Agents() {
     try {
       const created = await api<Agent>('/api/agents', {
         method: 'POST',
-        body: JSON.stringify({ name: name.trim(), description: description.trim() }),
+        body: JSON.stringify({
+          name: name.trim(),
+          description: description.trim(),
+          enable_versioning: enableVersioning,
+        }),
       })
       navigate(`/agents/${created.id}`)
     } catch (err) {
@@ -73,35 +78,10 @@ export default function Agents() {
   const handleDuplicate = async (ag: Agent) => {
     setOpenMenuId(null)
     try {
-      const full = await api<AgentDetail>(`/api/agents/${ag.id}`)
-      const created = await api<Agent>('/api/agents', {
+      await api<Agent>(`/api/agents/${ag.id}/duplicate`, {
         method: 'POST',
         body: JSON.stringify({
-          name: `${full.name} (Copied)`,
-          description: full.description || '',
-        }),
-      })
-      await api(`/api/agents/${created.id}`, {
-        method: 'PUT',
-        body: JSON.stringify({
-          name: `${full.name} (Copied)`,
-          description: full.description || '',
-          active: full.active,
-          provider: full.provider,
-          model: full.model,
-          voice: full.voice,
-          language: full.language,
-          timezone: full.timezone,
-          system_prompt: full.system_prompt,
-          first_message: full.first_message,
-          first_message_interruptible: full.first_message_interruptible,
-          max_duration_seconds: full.max_duration_seconds,
-          recording_enabled: full.recording_enabled,
-          variables: full.variables || [],
-          initiation_webhook_url: full.initiation_webhook_url || '',
-          initiation_webhook_timeout_ms: full.initiation_webhook_timeout_ms || 3000,
-          system_tools: full.system_tools || ['encerrar_conversa'],
-          tools: full.tools || [],
+          name: `${ag.name} (Cópia)`,
         }),
       })
       await load()
@@ -459,6 +439,23 @@ export default function Agents() {
                 className="w-full px-3.5 py-2 bg-white border border-zinc-200 rounded-xl text-sm text-zinc-900 focus:outline-none focus:border-zinc-400"
               />
             </div>
+
+            <label className="flex items-start gap-2.5 p-3 rounded-xl bg-zinc-50 border border-zinc-200/80 cursor-pointer text-xs">
+              <input
+                type="checkbox"
+                checked={enableVersioning}
+                onChange={(e) => setEnableVersioning(e.target.checked)}
+                className="mt-0.5 rounded border-zinc-300 text-zinc-900"
+              />
+              <div>
+                <span className="font-semibold text-zinc-900 block">
+                  Habilitar controle de versão (Branches & Divisão de Tráfego)
+                </span>
+                <span className="text-[11px] text-zinc-500">
+                  Cria a branch Main com snapshots imutáveis (agtvrsn_xxxx) e experimentos A/B.
+                </span>
+              </div>
+            </label>
 
             <div className="flex justify-end gap-2 pt-2">
               <Button type="button" variant="secondary" onClick={() => setIsModalOpen(false)}>

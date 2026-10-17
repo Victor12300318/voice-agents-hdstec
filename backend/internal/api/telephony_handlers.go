@@ -50,7 +50,7 @@ func (s *Server) handleJambonzWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if cfg, _, err := s.resolveAgentConfig(r.Context(), phone.OrganizationID, agent); err == nil {
+	if cfg, _, err := s.resolveAgentConfigForCall(r.Context(), phone.OrganizationID, agent, req.CallSid); err == nil {
 		s.Runtime.PrefetchInitiation(req.CallSid, agent.ID, req.From, req.To, cfg)
 	}
 
@@ -109,7 +109,7 @@ func (s *Server) handleJambonzAudioWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, versionID, err := s.resolveAgentConfig(ctx, orgID, ag)
+	cfg, versionID, err := s.resolveAgentConfigForCall(ctx, orgID, ag, callSid)
 	if err != nil {
 		s.Log.Error("jambonz_resolve_config_error", "agent_id", agentID, "error", err)
 		_ = ws.Close(websocket.StatusInternalError, "config error")
@@ -180,7 +180,7 @@ func (s *Server) handleTwilioWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Dispara em paralelo o Initiation Webhook durante o ringing/conexão da Twilio (padrão ElevenLabs Twilio Personalization)
-	if cfg, _, err := s.resolveAgentConfig(r.Context(), phone.OrganizationID, agent); err == nil {
+	if cfg, _, err := s.resolveAgentConfigForCall(r.Context(), phone.OrganizationID, agent, callSid); err == nil {
 		s.Runtime.PrefetchInitiation(callSid, agent.ID, from, to, cfg)
 	}
 
@@ -288,7 +288,7 @@ func (s *Server) handleTwilioAudioWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, versionID, err := s.resolveAgentConfig(ctx, orgID, ag)
+	cfg, versionID, err := s.resolveAgentConfigForCall(ctx, orgID, ag, callSid)
 	if err != nil {
 		s.Log.Error("twilio_resolve_config_error", "agent_id", agentID, "error", err)
 		_ = ws.Close(websocket.StatusInternalError, "config error")
@@ -323,11 +323,10 @@ func (s *Server) handleTwilioAudioWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) resolveAgentConfig(ctx context.Context, orgID string, ag store.Agent) (store.AgentConfig, *string, error) {
-	v, err := s.Store.LatestVersion(ctx, orgID, ag.ID)
-	if err == nil {
-		return v.Snapshot, &v.ID, nil
-	}
-	// Fallback para o Draft
-	cfg, err := s.Store.DraftConfig(ctx, orgID, ag)
-	return cfg, nil, err
+	return s.resolveAgentConfigForCall(ctx, orgID, ag, "")
+}
+
+func (s *Server) resolveAgentConfigForCall(ctx context.Context, orgID string, ag store.Agent, routingKey string) (store.AgentConfig, *string, error) {
+	cfg, verID, _, err := s.Store.RouteVersionForConversation(ctx, orgID, ag, routingKey)
+	return cfg, verID, err
 }
