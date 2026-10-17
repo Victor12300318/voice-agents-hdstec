@@ -1,8 +1,7 @@
-name: voiceagent
-
 services:
   postgres:
     image: postgres:17-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-voiceagent}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voiceagent}
@@ -17,6 +16,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis-data:/data
@@ -28,6 +28,7 @@ services:
 
   backend:
     build: ./backend
+    restart: unless-stopped
     environment:
       HTTP_ADDR: ":8080"
       DATABASE_URL: postgres://${POSTGRES_USER:-voiceagent}:${POSTGRES_PASSWORD:-voiceagent}@postgres:5432/${POSTGRES_DB:-voiceagent}?sslmode=disable
@@ -61,50 +62,13 @@ services:
 
   frontend:
     build: ./frontend
+    restart: unless-stopped
     ports:
-      - "${FRONTEND_PORT:-8088}:80"
+      - "${FRONTEND_PORT:-8088}:8088"
     depends_on:
       - backend
-
-  # Testes de integração do backend: docker compose --profile test run --rm backend-test
-  postgres-test:
-    image: postgres:17-alpine
-    profiles: ["test"]
-    environment:
-      POSTGRES_USER: test
-      POSTGRES_PASSWORD: test
-      POSTGRES_DB: test
-    tmpfs:
-      - /var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U test -d test"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
-
-  backend-test:
-    image: golang:1.26-alpine
-    profiles: ["test"]
-    working_dir: /src
-    command: ["go", "test", "./..."]
-    environment:
-      CGO_ENABLED: "0"
-      TEST_DATABASE_URL: postgres://test:test@postgres-test:5432/test?sslmode=disable
-      TEST_REDIS_URL: redis://redis:6379/15
-      TEST_GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-    volumes:
-      - ./backend:/src
-      - go-mod-cache:/go/pkg/mod
-      - go-build-cache:/root/.cache/go-build
-    depends_on:
-      postgres-test:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
 
 volumes:
   postgres-data:
   redis-data:
   minio-data:
-  go-mod-cache:
-  go-build-cache:
