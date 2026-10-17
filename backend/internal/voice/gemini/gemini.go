@@ -71,10 +71,10 @@ type Provider struct {
 }
 
 func New(ctx context.Context, apiKey string) (*Provider, error) {
-	if apiKey == "" {
-		return nil, errors.New("GEMINI_API_KEY não definido")
+	if strings.TrimSpace(apiKey) == "" {
+		return &Provider{client: nil}, nil
 	}
-	c, err := genai.NewClient(ctx, &genai.ClientConfig{APIKey: apiKey, Backend: genai.BackendGeminiAPI})
+	c, err := genai.NewClient(ctx, &genai.ClientConfig{APIKey: strings.TrimSpace(apiKey), Backend: genai.BackendGeminiAPI})
 	if err != nil {
 		return nil, err
 	}
@@ -96,6 +96,9 @@ func (p *Provider) Catalog() voice.Catalog {
 }
 
 func (p *Provider) Connect(ctx context.Context, cfg voice.SessionConfig) (voice.Session, error) {
+	if p.client == nil {
+		return nil, errors.New("GEMINI_API_KEY não configurada")
+	}
 	conf := &genai.LiveConnectConfig{
 		ResponseModalities: []genai.Modality{genai.ModalityAudio},
 		SpeechConfig: &genai.SpeechConfig{VoiceConfig: &genai.VoiceConfig{

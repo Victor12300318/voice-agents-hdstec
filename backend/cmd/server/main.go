@@ -83,11 +83,9 @@ func serve(cfg config.Config, log *slog.Logger) error {
 	}
 	provList = append(provList, gem)
 
-	if cfg.OpenAIAPIKey != "" {
-		oai := openai.New(cfg.OpenAIAPIKey)
-		provList = append(provList, oai)
-		log.Info("provider_registered", "provider", openai.ProviderID)
-	}
+	oai := openai.New(cfg.OpenAIAPIKey)
+	provList = append(provList, oai)
+	log.Info("provider_registered", "provider", openai.ProviderID)
 
 	voices := voice.NewRegistry(provList...)
 
