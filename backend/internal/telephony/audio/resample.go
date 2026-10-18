@@ -162,20 +162,62 @@ func ResamplePCM16WithHistory(input []byte, history *[]int16, inRate, outRate in
 	return out
 }
 
-// boostCallerSpeechPCM16 aplica ganho linear limpo (1.15x) sem gate nem joelho não-linear,
-// preservando 100% das consoantes fricativas/nasais (s, f, t, p, c, n, m) para o ASR.
+// boostCallerSpeechPCM16 aplica supressão suave do piso de quantização G.711 μ-law (< 40)
+// seguida de ganho vocal WebRTC (+6.5 dB / 2.1x) com soft-knee acima de 22.000, deixando a voz
+// do cliente alta, limpa e sem chiado de fundo.
 func boostCallerSpeechPCM16(pcm []byte) []byte {
 	numSamples := len(pcm) / 2
 	for i := 0; i < numSamples; i++ {
 		raw := int16(binary.LittleEndian.Uint16(pcm[i*2:]))
-		boosted := float64(raw) * 1.15
-		if boosted > 32600 {
-			boosted = 32600
-		} else if boosted < -32600 {
-			boosted = -32600
+		val := float64(raw)
+		absVal := math.Abs(val)
+		sign := 1.0
+		if val < 0 {
+			sign = -1.0
 		}
-		outSample := int16(math.Round(boosted))
+
+		var out float64
+		if absVal < 40.0 {
+			// Atenuação quadrática contínua do ruído de quantização G.711 em silêncio (sem corte abrupto)
+			out = (absVal * absVal / 40.0) * 0.5
+		} else {
+			out = absVal * 2.1
+		}
+
+		// Soft-knee limiter acima de 22.000 para nunca distorcer vogais fortes
+		if out > 22000.0 {
+			excess := out - 22000.0
+			out = 22000.0 + 10000.0*math.Tanh(excess/10000.0)
+		}
+		if out > 32400.0 {
+			out = 32400.0
+		}
+
+		outSample := int16(math.Round(sign * out))
 		binary.LittleEndian.PutUint16(pcm[i*2:], uint16(outSample))
+	}
+	return pcm
+}
+
+// deHissUpsampledPCM16 aplica um filtro FIR passa-baixas anti-imagem (fc ~3.550 Hz) no sinal
+// upsampled de 8kHz para 16kHz/24kHz, removendo os degraus de alta frequência ("chiado") do G.711 μ-law.
+func deHissUpsampledPCM16(pcm []byte) []byte {
+	n := len(pcm) / 2
+	if n < 5 {
+		return pcm
+	}
+	samples := make([]int16, n)
+	for i := 0; i < n; i++ {
+		samples[i] = int16(binary.LittleEndian.Uint16(pcm[i*2:]))
+	}
+	for i := 2; i < n-2; i++ {
+		// Kernel FIR simétrico de fase linear [0.10, 0.24, 0.32, 0.24, 0.10] (corte suave acima de 3.5 kHz)
+		acc := 0.10*float64(samples[i-2]) +
+			0.24*float64(samples[i-1]) +
+			0.32*float64(samples[i]) +
+			0.24*float64(samples[i+1]) +
+			0.10*float64(samples[i+2])
+		binary.LittleEndian.PutUint16(pcm[i*2:], uint16(int16(math.Round(acc))))
 	}
 	return pcm
 }
@@ -191,7 +233,8 @@ func TelephonyToProviderWithHistory(muLaw8k []byte, history *[]int16, providerIn
 	if providerInputSampleRate == 8000 {
 		return pcm8k
 	}
-	return ResamplePCM16WithHistory(pcm8k, history, 8000, providerInputSampleRate)
+	upsampled := ResamplePCM16WithHistory(pcm8k, history, 8000, providerInputSampleRate)
+	return deHissUpsampledPCM16(upsampled)
 }
 
 // ProviderToTelephony converte áudio PCM16 retornado pelo modelo de IA (24kHz) para G.711 μ-law (8kHz).

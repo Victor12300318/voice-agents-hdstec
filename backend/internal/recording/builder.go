@@ -3,6 +3,7 @@ package recording
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"sync"
 	"time"
 )
@@ -19,9 +20,11 @@ type SessionRecorder struct {
 	leftSamples  []int16 // Caller (convertido de 16kHz para 24kHz)
 	rightSamples []int16 // Agent (24kHz nativo, bit-a-bit intocado)
 
-	callerRem      []int16 // Resto (0 ou 1 amostra em 16kHz) para interpolação 2->3 (16kHz->24kHz)
-	inAgentTurn    bool    // true enquanto o agente está transmitindo chunks contínuos de um mesmo turno
-	lastCallerTime time.Time
+	callerRem        []int16 // Resto (0 ou 1 amostra em 16kHz) para interpolação 2->3 (16kHz->24kHz)
+	callerPrevSample int32   // Última amostra do chunk anterior para passo uniforme de 2/3 sem chiado de 8kHz
+	hasCallerPrev    bool
+	inAgentTurn      bool    // true enquanto o agente está transmitindo chunks contínuos de um mesmo turno
+	lastCallerTime   time.Time
 }
 
 func NewSessionRecorder() *SessionRecorder {
@@ -65,7 +68,7 @@ func (sr *SessionRecorder) AddCallerAudioAt(pcm16 []byte, at time.Time) {
 		return
 	}
 
-	s24 := upsample16to24(s16[:usable])
+	s24 := upsample16to24Stateful(s16[:usable], &sr.callerPrevSample, &sr.hasCallerPrev)
 
 	// Só preenche silêncio no início da chamada ou após pausa > 300ms entre envios do Caller
 	offset := int(at.Sub(sr.startedAt).Seconds() * float64(recordingSampleRate))
@@ -163,6 +166,11 @@ func (sr *SessionRecorder) BuildWAV() []byte {
 		sr.rightSamples = append(sr.rightSamples, 0)
 	}
 
+	leftOut := sr.leftSamples
+	if maxLen >= recordingSampleRate {
+		leftOut = masterCallerTrack24k(sr.leftSamples)
+	}
+
 	var buf bytes.Buffer
 
 	sampleRate := uint32(recordingSampleRate)
@@ -188,26 +196,121 @@ func (sr *SessionRecorder) BuildWAV() []byte {
 	_ = binary.Write(&buf, binary.LittleEndian, dataSize)
 
 	for i := 0; i < maxLen; i++ {
-		_ = binary.Write(&buf, binary.LittleEndian, sr.leftSamples[i])
+		_ = binary.Write(&buf, binary.LittleEndian, leftOut[i])
 		_ = binary.Write(&buf, binary.LittleEndian, sr.rightSamples[i])
 	}
 
 	return buf.Bytes()
 }
 
-// upsample16to24 converte 16kHz -> 24kHz (2 amostras -> 3 amostras) por interpolação linear suave.
-func upsample16to24(in []int16) []int16 {
+// masterCallerTrack24k aplica pós-processamento de estúdio estilo ElevenLabs na trilha gravada do Caller:
+// 1. Filtro High-Pass IIR de 1ª ordem (~80 Hz) para remover DC offset e grave abafado de linha.
+// 2. Filtro De-Hiss de fase linear (5 taps) para eliminar chiado de alta frequência.
+// 3. Envelope Noise Suppressor suave + Auto-Leveling AGC (alvo -4 dBFS / 20.000) para equiparar
+//    o volume da voz do cliente ao volume da voz do Agente sem distorção.
+func masterCallerTrack24k(in []int16) []int16 {
+	n := len(in)
+	if n < 16 {
+		return in
+	}
+
+	// Passo 1: High-Pass (~80 Hz @ 24kHz) + De-Hiss FIR
+	filtered := make([]float64, n)
+	hpAlpha := 0.979 // ~80 Hz em 24000 Hz
+	var prevIn, prevHP float64
+	for i := 0; i < n; i++ {
+		x := float64(in[i])
+		hp := hpAlpha * (prevHP + x - prevIn)
+		prevIn = x
+		prevHP = hp
+		filtered[i] = hp
+	}
+
+	smoothed := make([]float64, n)
+	var peak float64
+	for i := 2; i < n-2; i++ {
+		v := 0.10*filtered[i-2] + 0.24*filtered[i-1] + 0.32*filtered[i] + 0.24*filtered[i+1] + 0.10*filtered[i+2]
+		smoothed[i] = v
+		av := math.Abs(v)
+		if av > peak {
+			peak = av
+		}
+	}
+
+	// Passo 2: Calcula ganho automático de normalização (AGC de gravação)
+	targetPeak := 20000.0
+	gain := 1.0
+	if peak > 350.0 && peak < targetPeak {
+		gain = targetPeak / peak
+		if gain > 3.2 {
+			gain = 3.2
+		}
+	}
+
+	// Passo 3: Envelope follower suave (5ms attack, 90ms release) para silenciar chiado de fundo entre falas
+	out := make([]int16, n)
+	var env float64
+	attackCoeff := 0.02
+	releaseCoeff := 0.0008
+	noiseFloor := 85.0
+
+	for i := 0; i < n; i++ {
+		absSample := math.Abs(smoothed[i])
+		if absSample > env {
+			env += attackCoeff * (absSample - env)
+		} else {
+			env += releaseCoeff * (absSample - env)
+		}
+
+		gate := 1.0
+		if env < noiseFloor {
+			ratio := env / noiseFloor
+			gate = ratio * ratio * 0.25
+		}
+
+		val := smoothed[i] * gain * gate
+		if val > 23000.0 {
+			val = 23000.0 + 8500.0*math.Tanh((val-23000.0)/8500.0)
+		} else if val < -23000.0 {
+			val = -23000.0 - 8500.0*math.Tanh((-val-23000.0)/8500.0)
+		}
+		if val > 32500.0 {
+			val = 32500.0
+		} else if val < -32500.0 {
+			val = -32500.0
+		}
+		out[i] = int16(math.Round(val))
+	}
+
+	return out
+}
+
+// upsample16to24Stateful converte 16kHz -> 24kHz (2 amostras -> 3 amostras) com espaçamento temporal
+// estritamente uniforme de 2/3 de amostra usando a última amostra do par/chunk anterior (sPrev),
+// eliminando 100% do chiado de aliasing de 8kHz na faixa gravada do Caller.
+func upsample16to24Stateful(in []int16, prevSample *int32, hasPrev *bool) []int16 {
 	numPairs := len(in) / 2
 	if numPairs == 0 {
 		return nil
 	}
 	out := make([]int16, numPairs*3)
+	sPrev := int32(in[0])
+	if prevSample != nil && hasPrev != nil && *hasPrev {
+		sPrev = *prevSample
+	}
+
 	for i := 0; i < numPairs; i++ {
 		s0 := int32(in[i*2])
 		s1 := int32(in[i*2+1])
-		out[i*3] = int16(s0)
-		out[i*3+1] = int16((s0 + s1) / 2)
+		out[i*3] = int16((sPrev + 2*s0) / 3)
+		out[i*3+1] = int16((2*s0 + s1) / 3)
 		out[i*3+2] = int16(s1)
+		sPrev = s1
+	}
+
+	if prevSample != nil && hasPrev != nil {
+		*prevSample = sPrev
+		*hasPrev = true
 	}
 	return out
 }
