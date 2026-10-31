@@ -2,10 +2,13 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+var ErrPhoneNumberUnassigned = errors.New("phone_number_unassigned")
 
 type PhoneNumber struct {
 	ID               string    `json:"id"`
@@ -40,8 +43,19 @@ type CreatePhoneNumberParams struct {
 	TwilioPhoneSid   string
 }
 
-const phoneCols = `p.id, p.organization_id, p.e164, p.label, p.agent_id, p.direction, p.provider, p.twilio_account_sid, p.twilio_auth_token, p.twilio_phone_sid, p.active, p.created_at, p.updated_at`
-const phoneColsPlain = `id, organization_id, e164, label, agent_id, direction, provider, twilio_account_sid, twilio_auth_token, twilio_phone_sid, active, created_at, updated_at`
+type UpdatePhoneNumberParams struct {
+	Label            *string
+	AgentID          *string
+	Direction        *string
+	Provider         *string
+	TwilioAccountSid *string
+	TwilioAuthToken  *string
+	TwilioPhoneSid   *string
+	Active           *bool
+}
+
+const phoneCols = `p.id, p.organization_id, p.e164, p.label, COALESCE(p.agent_id::text, '') AS agent_id, p.direction, p.provider, p.twilio_account_sid, p.twilio_auth_token, p.twilio_phone_sid, p.active, p.created_at, p.updated_at`
+const phoneColsPlain = `id, organization_id, e164, label, COALESCE(agent_id::text, '') AS agent_id, direction, provider, twilio_account_sid, twilio_auth_token, twilio_phone_sid, active, created_at, updated_at`
 
 func scanPhone(r scanner) (PhoneNumber, error) {
 	var p PhoneNumber
@@ -64,6 +78,28 @@ func scanPhone(r scanner) (PhoneNumber, error) {
 	return p, err
 }
 
+func scanPhoneWithAgent(r scanner) (PhoneNumberWithAgent, error) {
+	var item PhoneNumberWithAgent
+	err := r.Scan(
+		&item.ID,
+		&item.OrganizationID,
+		&item.E164,
+		&item.Label,
+		&item.AgentID,
+		&item.Direction,
+		&item.Provider,
+		&item.TwilioAccountSid,
+		&item.TwilioAuthToken,
+		&item.TwilioPhoneSid,
+		&item.Active,
+		&item.CreatedAt,
+		&item.UpdatedAt,
+		&item.AgentName,
+	)
+	item.HasTwilioAuth = item.TwilioAuthToken != ""
+	return item, err
+}
+
 func (s *Store) ListPhoneNumbers(ctx context.Context, orgID string) ([]PhoneNumberWithAgent, error) {
 	query := `
 		SELECT ` + phoneCols + `, COALESCE(a.name, '') AS agent_name
@@ -79,15 +115,10 @@ func (s *Store) ListPhoneNumbers(ctx context.Context, orgID string) ([]PhoneNumb
 
 	var out []PhoneNumberWithAgent
 	for rows.Next() {
-		var item PhoneNumberWithAgent
-		if err := rows.Scan(
-			&item.ID, &item.OrganizationID, &item.E164, &item.Label, &item.AgentID,
-			&item.Direction, &item.Provider, &item.TwilioAccountSid, &item.TwilioAuthToken, &item.TwilioPhoneSid,
-			&item.Active, &item.CreatedAt, &item.UpdatedAt, &item.AgentName,
-		); err != nil {
+		item, err := scanPhoneWithAgent(rows)
+		if err != nil {
 			return nil, err
 		}
-		item.HasTwilioAuth = item.TwilioAuthToken != ""
 		out = append(out, item)
 	}
 	return out, rows.Err()
@@ -105,7 +136,34 @@ func (s *Store) GetPhoneNumber(ctx context.Context, orgID, id string) (PhoneNumb
 	return p, nil
 }
 
-func (s *Store) CreatePhoneNumber(ctx context.Context, orgID string, in CreatePhoneNumberParams) (PhoneNumber, error) {
+func (s *Store) GetPhoneNumberWithAgent(ctx context.Context, orgID, id string) (PhoneNumberWithAgent, error) {
+	row := s.Pool.QueryRow(ctx, `
+		SELECT `+phoneCols+`, COALESCE(a.name, '') AS agent_name
+		FROM phone_numbers p
+		LEFT JOIN agents a ON a.id = p.agent_id
+		WHERE p.organization_id = $1 AND p.id = $2`, orgID, id)
+	p, err := scanPhoneWithAgent(row)
+	if err != nil {
+		return p, notFound(err)
+	}
+	return p, nil
+}
+
+func (s *Store) GetPhoneNumberByE164(ctx context.Context, orgID, e164 string) (PhoneNumber, error) {
+	e164Norm := normalizeE164(e164)
+	row := s.Pool.QueryRow(ctx, `
+		SELECT `+phoneCols+`
+		FROM phone_numbers p
+		WHERE p.organization_id = $1 AND (p.e164 = $2 OR p.e164 = $3)
+		LIMIT 1`, orgID, e164Norm, strings.TrimPrefix(e164Norm, "+"))
+	p, err := scanPhone(row)
+	if err != nil {
+		return p, notFound(err)
+	}
+	return p, nil
+}
+
+func (s *Store) CreatePhoneNumber(ctx context.Context, orgID string, in CreatePhoneNumberParams) (PhoneNumberWithAgent, error) {
 	if in.Direction == "" {
 		in.Direction = "inbound"
 	}
@@ -113,12 +171,13 @@ func (s *Store) CreatePhoneNumber(ctx context.Context, orgID string, in CreatePh
 		in.Provider = "jambonz"
 	}
 	e164 := normalizeE164(in.E164)
+	agentID := strings.TrimSpace(in.AgentID)
 	row := s.Pool.QueryRow(ctx, `
 		INSERT INTO phone_numbers (
 			organization_id, e164, label, agent_id, direction,
 			provider, twilio_account_sid, twilio_auth_token, twilio_phone_sid, active
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)
+		VALUES ($1, $2, $3, NULLIF($4, '')::uuid, $5, $6, $7, $8, $9, true)
 		ON CONFLICT (organization_id, e164) DO UPDATE
 		SET label = EXCLUDED.label,
 		    agent_id = EXCLUDED.agent_id,
@@ -130,39 +189,75 @@ func (s *Store) CreatePhoneNumber(ctx context.Context, orgID string, in CreatePh
 		    active = true,
 		    updated_at = now()
 		RETURNING `+phoneColsPlain,
-		orgID, e164, in.Label, in.AgentID, in.Direction,
+		orgID, e164, in.Label, agentID, in.Direction,
 		in.Provider, strings.TrimSpace(in.TwilioAccountSid), strings.TrimSpace(in.TwilioAuthToken), strings.TrimSpace(in.TwilioPhoneSid),
 	)
-	return scanPhone(row)
+	created, err := scanPhone(row)
+	if err != nil {
+		return PhoneNumberWithAgent{}, err
+	}
+	return s.GetPhoneNumberWithAgent(ctx, orgID, created.ID)
 }
 
-func (s *Store) UpdatePhoneNumber(ctx context.Context, orgID, id, label, agentID, direction, provider, twilioAccountSid, twilioAuthToken, twilioPhoneSid string, active bool) (PhoneNumber, error) {
-	if direction == "" {
-		direction = "inbound"
+func (s *Store) UpdatePhoneNumber(ctx context.Context, orgID, id string, in UpdatePhoneNumberParams) (PhoneNumberWithAgent, error) {
+	curr, err := s.GetPhoneNumber(ctx, orgID, id)
+	if err != nil {
+		return PhoneNumberWithAgent{}, err
 	}
-	if provider == "" {
-		provider = "jambonz"
+
+	label := curr.Label
+	if in.Label != nil {
+		label = *in.Label
 	}
+	agentID := curr.AgentID
+	if in.AgentID != nil {
+		agentID = strings.TrimSpace(*in.AgentID)
+	}
+	direction := curr.Direction
+	if in.Direction != nil && strings.TrimSpace(*in.Direction) != "" {
+		direction = strings.TrimSpace(*in.Direction)
+	}
+	provider := curr.Provider
+	if in.Provider != nil && strings.TrimSpace(*in.Provider) != "" {
+		provider = strings.TrimSpace(*in.Provider)
+	}
+	twilioAccountSid := curr.TwilioAccountSid
+	if in.TwilioAccountSid != nil && strings.TrimSpace(*in.TwilioAccountSid) != "" {
+		twilioAccountSid = strings.TrimSpace(*in.TwilioAccountSid)
+	}
+	twilioAuthToken := curr.TwilioAuthToken
+	if in.TwilioAuthToken != nil && strings.TrimSpace(*in.TwilioAuthToken) != "" {
+		twilioAuthToken = strings.TrimSpace(*in.TwilioAuthToken)
+	}
+	twilioPhoneSid := curr.TwilioPhoneSid
+	if in.TwilioPhoneSid != nil && strings.TrimSpace(*in.TwilioPhoneSid) != "" {
+		twilioPhoneSid = strings.TrimSpace(*in.TwilioPhoneSid)
+	}
+	active := curr.Active
+	if in.Active != nil {
+		active = *in.Active
+	}
+
 	row := s.Pool.QueryRow(ctx, `
 		UPDATE phone_numbers
 		SET label = $3,
-		    agent_id = $4,
+		    agent_id = NULLIF($4, '')::uuid,
 		    direction = $5,
 		    provider = $6,
-		    twilio_account_sid = CASE WHEN $7 = '' THEN phone_numbers.twilio_account_sid ELSE $7 END,
-		    twilio_auth_token = CASE WHEN $8 = '' THEN phone_numbers.twilio_auth_token ELSE $8 END,
-		    twilio_phone_sid = CASE WHEN $9 = '' THEN phone_numbers.twilio_phone_sid ELSE $9 END,
+		    twilio_account_sid = $7,
+		    twilio_auth_token = $8,
+		    twilio_phone_sid = $9,
 		    active = $10,
 		    updated_at = now()
 		WHERE organization_id = $1 AND id = $2
 		RETURNING `+phoneColsPlain,
 		orgID, id, label, agentID, direction, provider,
-		strings.TrimSpace(twilioAccountSid), strings.TrimSpace(twilioAuthToken), strings.TrimSpace(twilioPhoneSid), active)
-	p, err := scanPhone(row)
+		twilioAccountSid, twilioAuthToken, twilioPhoneSid, active)
+	updated, err := scanPhone(row)
 	if err != nil {
-		return p, notFound(err)
+		return PhoneNumberWithAgent{}, notFound(err)
 	}
-	return p, nil
+	return s.GetPhoneNumberWithAgent(ctx, orgID, updated.ID)
 }
 
 func (s *Store) DeletePhoneNumber(ctx context.Context, orgID, id string) error {
@@ -191,6 +286,9 @@ func (s *Store) FindAgentByPhoneNumber(ctx context.Context, e164 string) (PhoneN
 	p, err := scanPhone(row)
 	if err != nil {
 		return p, Agent{}, fmt.Errorf("phone number %s not mapped: %w", e164, notFound(err))
+	}
+	if p.AgentID == "" {
+		return p, Agent{}, fmt.Errorf("phone number %s has no assigned agent: %w", e164, ErrPhoneNumberUnassigned)
 	}
 
 	ag, err := s.GetAgent(ctx, p.OrganizationID, p.AgentID)

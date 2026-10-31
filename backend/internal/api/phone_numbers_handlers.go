@@ -23,14 +23,14 @@ type createPhoneNumberRequest struct {
 }
 
 type updatePhoneNumberRequest struct {
-	Label            string `json:"label"`
-	AgentID          string `json:"agent_id"`
-	Direction        string `json:"direction"`
-	Provider         string `json:"provider"`
-	TwilioAccountSid string `json:"twilio_account_sid"`
-	TwilioAuthToken  string `json:"twilio_auth_token"`
-	TwilioPhoneSid   string `json:"twilio_phone_sid"`
-	Active           bool   `json:"active"`
+	Label            *string `json:"label"`
+	AgentID          *string `json:"agent_id"`
+	Direction        *string `json:"direction"`
+	Provider         *string `json:"provider"`
+	TwilioAccountSid *string `json:"twilio_account_sid"`
+	TwilioAuthToken  *string `json:"twilio_auth_token"`
+	TwilioPhoneSid   *string `json:"twilio_phone_sid"`
+	Active           *bool   `json:"active"`
 }
 
 type twilioAvailableRequest struct {
@@ -83,15 +83,13 @@ func (s *Server) createPhoneNumber(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "e164 é obrigatório"})
 		return
 	}
-	if req.AgentID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent_id é obrigatório"})
-		return
-	}
 
-	// Verifica se o agente pertence à organização
-	if _, err := s.Store.GetAgent(r.Context(), orgID, req.AgentID); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agente não encontrado"})
-		return
+	req.AgentID = strings.TrimSpace(req.AgentID)
+	if req.AgentID != "" {
+		if _, err := s.Store.GetAgent(r.Context(), orgID, req.AgentID); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agente não encontrado"})
+			return
+		}
 	}
 
 	// Se o usuário pediu para configurar automaticamente o VoiceUrl na Twilio
@@ -128,8 +126,13 @@ func (s *Server) createPhoneNumber(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) updatePhoneNumber(w http.ResponseWriter, r *http.Request) {
-	orgID := auth.FromContext(r.Context()).OrganizationID
+	sess := auth.FromContext(r.Context())
+	orgID := sess.OrganizationID
 	id := r.PathValue("id")
+	if !isUUID(id) {
+		writeError(w, http.StatusNotFound, "não encontrado")
+		return
+	}
 
 	var req updatePhoneNumberRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -137,23 +140,45 @@ func (s *Server) updatePhoneNumber(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.AgentID != "" {
-		if _, err := s.Store.GetAgent(r.Context(), orgID, req.AgentID); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agente não encontrado"})
-			return
+	prev, err := s.Store.GetPhoneNumber(r.Context(), orgID, id)
+	if err != nil {
+		s.notFoundOr(w, r, err)
+		return
+	}
+
+	if req.AgentID != nil {
+		aid := strings.TrimSpace(*req.AgentID)
+		if aid != "" {
+			if _, err := s.Store.GetAgent(r.Context(), orgID, aid); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agente não encontrado"})
+				return
+			}
 		}
 	}
 
-	updated, err := s.Store.UpdatePhoneNumber(
-		r.Context(), orgID, id,
-		req.Label, req.AgentID, req.Direction, req.Provider,
-		req.TwilioAccountSid, req.TwilioAuthToken, req.TwilioPhoneSid,
-		req.Active,
-	)
+	updated, err := s.Store.UpdatePhoneNumber(r.Context(), orgID, id, store.UpdatePhoneNumberParams{
+		Label:            req.Label,
+		AgentID:          req.AgentID,
+		Direction:        req.Direction,
+		Provider:         req.Provider,
+		TwilioAccountSid: req.TwilioAccountSid,
+		TwilioAuthToken:  req.TwilioAuthToken,
+		TwilioPhoneSid:   req.TwilioPhoneSid,
+		Active:           req.Active,
+	})
 	if err != nil {
-		s.internalError(w, r, err)
+		s.notFoundOr(w, r, err)
 		return
 	}
+
+	s.Log.Info("phone_number_updated",
+		"org_id", orgID,
+		"user_id", sess.UserID,
+		"phone_id", id,
+		"e164", updated.E164,
+		"previous_agent_id", prev.AgentID,
+		"new_agent_id", updated.AgentID,
+	)
 
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -163,7 +188,7 @@ func (s *Server) deletePhoneNumber(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	if err := s.Store.DeletePhoneNumber(r.Context(), orgID, id); err != nil {
-		s.internalError(w, r, err)
+		s.notFoundOr(w, r, err)
 		return
 	}
 

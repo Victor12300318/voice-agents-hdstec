@@ -83,8 +83,7 @@ func defaultOf(opts []voice.Option) string {
 // agentDetail é o Agent (Draft) + o estado de publicação e controle de versão por branches.
 type agentDetail struct {
 	store.Agent
-	LatestVersion              *int                 `json:"latest_version"`
-	LatestVersionID            *string              `json:"latest_version_id,omitempty"`
+	LatestVersionID            *string                   `json:"latest_version_id,omitempty"`
 	HasUnpublishedChanges      bool                 `json:"has_unpublished_changes"`
 	PublishErrors              []string             `json:"publish_errors"`
 	CurrentBranch              *store.AgentBranch   `json:"current_branch,omitempty"`

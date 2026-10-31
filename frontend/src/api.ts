@@ -389,6 +389,7 @@ export type Agent = {
   system_tools_config?: SystemToolsConfig
   tools: string[]
   versioning_enabled?: boolean
+  latest_version?: number | null
   created_at: string
   updated_at: string
 }
@@ -469,6 +470,17 @@ export type PhoneNumber = {
   active: boolean
   created_at: string
   updated_at: string
+}
+
+export type PhoneNumberUpdatePayload = {
+  label?: string
+  agent_id?: string
+  direction?: string
+  provider?: string
+  twilio_account_sid?: string
+  twilio_auth_token?: string
+  twilio_phone_sid?: string
+  active?: boolean
 }
 
 export type TwilioAvailableNumber = {

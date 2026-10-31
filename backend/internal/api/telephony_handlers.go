@@ -50,24 +50,28 @@ func (s *Server) handleJambonzWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if cfg, _, err := s.resolveAgentConfigForCall(r.Context(), phone.OrganizationID, agent, req.CallSid); err == nil {
+	if cfg, versionID, err := s.resolveAgentConfigForCall(r.Context(), phone.OrganizationID, agent, req.CallSid); err != nil || versionID == nil {
+		s.Log.Warn("jambonz_agent_no_published_version", "to", req.To, "phone_id", phone.ID, "agent_id", agent.ID, "error", err)
+		rejectApp := telephony.BuildRejectApp("O número chamado não está associado a nenhum atendente de voz ativo no momento.")
+		writeJSON(w, http.StatusOK, rejectApp)
+		return
+	} else {
 		s.Runtime.PrefetchInitiation(req.CallSid, agent.ID, req.From, req.To, cfg)
+		baseWS := s.resolveBaseWSURL(r)
+
+		audioWSURL := fmt.Sprintf("%s/ws/telephony/jambonz/audio?call_sid=%s&did=%s&from=%s&agent_id=%s&org_id=%s",
+			baseWS,
+			url.QueryEscape(req.CallSid),
+			url.QueryEscape(req.To),
+			url.QueryEscape(req.From),
+			phone.AgentID,
+			phone.OrganizationID,
+		)
+
+		listenApp := telephony.BuildListenApp(audioWSURL)
+		s.Log.Info("jambonz_routing_call", "agent", agent.Name, "phone_id", phone.ID, "agent_id", agent.ID, "version_id", *versionID, "ws_url", audioWSURL)
+		writeJSON(w, http.StatusOK, listenApp)
 	}
-
-	baseWS := s.resolveBaseWSURL(r)
-
-	audioWSURL := fmt.Sprintf("%s/ws/telephony/jambonz/audio?call_sid=%s&did=%s&from=%s&agent_id=%s&org_id=%s",
-		baseWS,
-		url.QueryEscape(req.CallSid),
-		url.QueryEscape(req.To),
-		url.QueryEscape(req.From),
-		phone.AgentID,
-		phone.OrganizationID,
-	)
-
-	listenApp := telephony.BuildListenApp(audioWSURL)
-	s.Log.Info("jambonz_routing_call", "agent", agent.Name, "ws_url", audioWSURL)
-	writeJSON(w, http.StatusOK, listenApp)
 }
 
 func (s *Server) handleJambonzStatus(w http.ResponseWriter, r *http.Request) {
@@ -110,7 +114,7 @@ func (s *Server) handleJambonzAudioWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg, versionID, err := s.resolveAgentConfigForCall(ctx, orgID, ag, callSid)
-	if err != nil {
+	if err != nil || versionID == nil {
 		s.Log.Error("jambonz_resolve_config_error", "agent_id", agentID, "error", err)
 		_ = ws.Close(websocket.StatusInternalError, "config error")
 		return
@@ -180,9 +184,16 @@ func (s *Server) handleTwilioWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Dispara em paralelo o Initiation Webhook durante o ringing/conexão da Twilio (padrão ElevenLabs Twilio Personalization)
-	if cfg, _, err := s.resolveAgentConfigForCall(r.Context(), phone.OrganizationID, agent, callSid); err == nil {
-		s.Runtime.PrefetchInitiation(callSid, agent.ID, from, to, cfg)
+	cfg, versionID, err := s.resolveAgentConfigForCall(r.Context(), phone.OrganizationID, agent, callSid)
+	if err != nil || versionID == nil {
+		s.Log.Warn("twilio_agent_no_published_version", "to", to, "phone_id", phone.ID, "agent_id", agent.ID, "error", err)
+		twiml := telephony.BuildTwilioRejectTwiML("O número chamado não está associado a nenhum atendente de voz ativo no momento.")
+		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(twiml))
+		return
 	}
+	s.Runtime.PrefetchInitiation(callSid, agent.ID, from, to, cfg)
 
 	baseWS := s.resolveBaseWSURL(r)
 	audioWSURL := fmt.Sprintf("%s/ws/telephony/twilio/audio", baseWS)
@@ -196,7 +207,7 @@ func (s *Server) handleTwilioWebhook(w http.ResponseWriter, r *http.Request) {
 		"phone_id": phone.ID,
 	})
 
-	s.Log.Info("twilio_routing_call", "agent", agent.Name, "ws_url", audioWSURL)
+	s.Log.Info("twilio_routing_call", "agent", agent.Name, "phone_id", phone.ID, "agent_id", agent.ID, "version_id", *versionID, "ws_url", audioWSURL)
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(twiml))
@@ -275,7 +286,7 @@ func (s *Server) handleTwilioAudioWS(w http.ResponseWriter, r *http.Request) {
 			authToken = p.TwilioAuthToken
 		}
 	} else if did != "" {
-		if p, _, err := s.Store.FindAgentByPhoneNumber(ctx, did); err == nil {
+		if p, err := s.Store.GetPhoneNumberByE164(ctx, orgID, did); err == nil {
 			accountSid = p.TwilioAccountSid
 			authToken = p.TwilioAuthToken
 		}
@@ -289,7 +300,7 @@ func (s *Server) handleTwilioAudioWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg, versionID, err := s.resolveAgentConfigForCall(ctx, orgID, ag, callSid)
-	if err != nil {
+	if err != nil || versionID == nil {
 		s.Log.Error("twilio_resolve_config_error", "agent_id", agentID, "error", err)
 		_ = ws.Close(websocket.StatusInternalError, "config error")
 		return
