@@ -366,18 +366,12 @@ func (rt *Runtime) RunSessionWithOptions(
 	}
 
 	if len(entryProcedures) > 0 {
-		toolSpecs = append(toolSpecs, voice.ToolSpec{
-			Name:        "ativar_procedure",
-			Description: "Ativa um procedimento de negócio quando o assunto do Caller corresponder ao seu gatilho. Retorna o passo a passo e libera as ferramentas necessárias.",
-			Parameters: []voice.Param{
-				{Name: "nome", Type: "string", Description: "Nome do procedimento a ativar", Required: true},
-			},
-		})
-
 		var triggerIndex strings.Builder
-		triggerIndex.WriteString("\n\n## PROCEDIMENTOS DO AGENTE (SIGA RIGOROSAMENTE QUANDO APLICÁVEL):\n")
-		triggerIndex.WriteString("Quando a solicitação do usuário corresponder a um dos procedimentos abaixo, siga suas diretrizes e passos (e chame \"ativar_procedure\" passando o nome do procedimento):\n")
+		var procNamesList []string
+		triggerIndex.WriteString("## PROCEDIMENTOS E GATILHOS OBRIGATÓRIOS DO AGENTE (PRIORIDADE MÁXIMA SOBRE O PROMPT GERAL):\n")
+		triggerIndex.WriteString("ATENÇÃO CRÍTICA: Os procedimentos abaixo têm precedência absoluta sobre quaisquer instruções gerais ou seções '# Actions' do prompt. Sempre que a fala do cliente acionar o gatilho (Trigger) de um procedimento abaixo (por exemplo: falar em nome de terceiro/familiar como marido, esposa, mãe, filho ou dependente; pedir segunda via de boleto/fatura; ou informar CPF), você DEVE seguir estritamente as regras e perguntas obrigatórias desse procedimento na ordem exata:\n")
 		for _, p := range entryProcedures {
+			procNamesList = append(procNamesList, fmt.Sprintf("%q (%s)", p.Name, p.Trigger))
 			triggerIndex.WriteString(fmt.Sprintf("\n### PROCEDIMENTO: %q\n- **Quando acionar (Trigger):** %s\n", p.Name, p.Trigger))
 			if expanded, expErr := procExpander.ExpandProcedure(ctx, orgID, agentID, p, procsMap); expErr == nil && strings.TrimSpace(expanded.ExpandedContent) != "" {
 				triggerIndex.WriteString(expanded.ExpandedContent)
@@ -392,7 +386,31 @@ func (rt *Runtime) RunSessionWithOptions(
 				triggerIndex.WriteString("\n")
 			}
 		}
-		systemPrompt += triggerIndex.String()
+		// Também inclui no bloco quaisquer sub-procedures ativos que possuam regras próprias (ex: Identificação/Autorização)
+		for _, p := range activeProcedures {
+			if referencedAsSubProc[p.ID] {
+				triggerIndex.WriteString(fmt.Sprintf("\n### PROCEDIMENTO COMPLEMENTAR OBRIGATÓRIO: %q\n- **Quando acionar (Trigger):** %s\n", p.Name, p.Trigger))
+				if expanded, expErr := procExpander.ExpandProcedure(ctx, orgID, agentID, p, procsMap); expErr == nil && strings.TrimSpace(expanded.ExpandedContent) != "" {
+					triggerIndex.WriteString(expanded.ExpandedContent)
+					triggerIndex.WriteString("\n")
+					for tName, ok := range expanded.AllowedTools {
+						if ok {
+							promptReferencedTools[tName] = true
+						}
+					}
+				}
+			}
+		}
+		// Posiciona os procedimentos no TOPO e no FINAL do systemPrompt para garantir precedência sobre prompts longos
+		systemPrompt = triggerIndex.String() + "\n\n---\n\n" + systemPrompt + "\n\n" + triggerIndex.String()
+
+		toolSpecs = append(toolSpecs, voice.ToolSpec{
+			Name:        "ativar_procedure",
+			Description: "Ativa um procedimento de negócio quando o assunto do Caller corresponder ao seu gatilho: " + strings.Join(procNamesList, "; "),
+			Parameters: []voice.Param{
+				{Name: "nome", Type: "string", Description: "Nome exato do procedimento a ativar", Required: true},
+			},
+		})
 	}
 
 	registerToolByID := func(toolID string) {
@@ -521,9 +539,11 @@ func (rt *Runtime) RunSessionWithOptions(
 	var silenceTimer *time.Timer
 
 	// Estado dos Procedures ativos durante a chamada (ADR 0001 + regra dos 5 mais recentes da ElevenLabs)
+	var procMu sync.Mutex
 	var activeProcedureName string
 	var activeProcedureID *string
 	var recentActivatedProcs []procedures.ActivatedProcedure
+	activatedProcIDs := make(map[string]bool)
 	activeAllowedTools := make(map[string]bool)
 	activeToolPolicies := make(map[string]procedures.ToolExecutionPolicy)
 	// Se o agente não possui procedures de entrada, todas as tools registradas ficam permitidas
@@ -546,6 +566,70 @@ func (rt *Runtime) RunSessionWithOptions(
 		for name := range registeredTools {
 			activeAllowedTools[name] = true
 		}
+	}
+
+	var activateProcedure func(targetProc store.ProcedureSnapshot) (procedures.ActivatedProcedure, bool, error)
+	activateProcedure = func(targetProc store.ProcedureSnapshot) (procedures.ActivatedProcedure, bool, error) {
+		expanded, err := procExpander.ExpandProcedure(sessionCtx, orgID, agentID, targetProc, procsMap)
+		if err != nil {
+			return procedures.ActivatedProcedure{}, false, err
+		}
+
+		procMu.Lock()
+		newlyActivated := !activatedProcIDs[targetProc.ID]
+		activatedProcIDs[targetProc.ID] = true
+		activeProcedureName = targetProc.Name
+		procIDCopy := targetProc.ID
+		activeProcedureID = &procIDCopy
+
+		recentActivatedProcs = append(recentActivatedProcs, expanded)
+		if len(recentActivatedProcs) > 5 {
+			recentActivatedProcs = recentActivatedProcs[len(recentActivatedProcs)-5:]
+		}
+		for _, rp := range recentActivatedProcs {
+			for k, v := range rp.AllowedTools {
+				if v {
+					activeAllowedTools[k] = true
+				}
+			}
+			for k, pol := range rp.ToolPolicies {
+				activeToolPolicies[k] = pol
+			}
+		}
+		procMu.Unlock()
+
+		if newlyActivated {
+			_ = sendJSON(serverMessage{Type: "procedure_activated", Text: targetProc.Name})
+			_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "procedure_activated", map[string]any{
+				"procedure_id": targetProc.ID,
+				"name":         targetProc.Name,
+				"trigger":      targetProc.Trigger,
+			})
+		}
+
+		// Se este procedimento referencia outros procedures (ex: Segunda Via -> Identificação/Autorização),
+		// ativa também os sub-procedures referenciados que ainda não foram ativados.
+		meta := procedures.InspectProcedure(store.Procedure{
+			ID:      targetProc.ID,
+			Name:    targetProc.Name,
+			Type:    targetProc.Type,
+			Trigger: targetProc.Trigger,
+			Content: targetProc.Content,
+		}, procsMap, nil, nil)
+		for _, subRef := range meta.ReferencedProcedureIDs {
+			for _, cand := range activeProcedures {
+				if cand.ID == subRef || strings.EqualFold(strings.TrimSpace(cand.Name), strings.TrimSpace(subRef)) {
+					procMu.Lock()
+					already := activatedProcIDs[cand.ID]
+					procMu.Unlock()
+					if !already {
+						_, _, _ = activateProcedure(cand)
+					}
+				}
+			}
+		}
+
+		return expanded, newlyActivated, nil
 	}
 
 	terminate := func(status, reason string) {
@@ -701,6 +785,22 @@ func (rt *Runtime) RunSessionWithOptions(
 					}
 					_ = sendJSON(serverMessage{Type: "caller_transcript", Text: normCaller})
 					_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "caller_transcript", map[string]any{"text": normCaller})
+
+					// Avaliação automática em tempo real dos gatilhos (Triggers) dos procedimentos a partir da fala do Caller
+					if trimmedCaller != "" && len(activeProcedures) > 0 {
+						guardianMu.Lock()
+						turnCallerText := lastCallerTurnText
+						guardianMu.Unlock()
+						matchedProcs := matchProceduresByCallerTranscript(turnCallerText, activeProcedures)
+						for _, mp := range matchedProcs {
+							procMu.Lock()
+							already := activatedProcIDs[mp.ID]
+							procMu.Unlock()
+							if !already {
+								_, _, _ = activateProcedure(mp)
+							}
+						}
+					}
 
 				case voice.EventAgentTranscript:
 					if callEnding.Load() {
@@ -1029,35 +1129,8 @@ func (rt *Runtime) RunSessionWithOptions(
 						}
 
 						if targetProc != nil {
-							expanded, err := procExpander.ExpandProcedure(sessionCtx, orgID, agentID, *targetProc, procsMap)
+							expanded, _, err := activateProcedure(*targetProc)
 							if err == nil {
-								activeProcedureName = targetProc.Name
-								activeProcedureID = &targetProc.ID
-
-								// Regra da ElevenLabs: mantém os até 5 procedures mais recentemente iniciados na janela ativa
-								recentActivatedProcs = append(recentActivatedProcs, expanded)
-								if len(recentActivatedProcs) > 5 {
-									recentActivatedProcs = recentActivatedProcs[len(recentActivatedProcs)-5:]
-								}
-
-								activeAllowedTools = make(map[string]bool)
-								activeToolPolicies = make(map[string]procedures.ToolExecutionPolicy)
-								for _, globalToolID := range cfg.Tools {
-									if t, err := rt.Store.GetTool(sessionCtx, orgID, globalToolID); err == nil {
-										activeAllowedTools[t.Name] = true
-									}
-								}
-								for _, rp := range recentActivatedProcs {
-									for k, v := range rp.AllowedTools {
-										if v {
-											activeAllowedTools[k] = true
-										}
-									}
-									for k, pol := range rp.ToolPolicies {
-										activeToolPolicies[k] = pol
-									}
-								}
-
 								res := map[string]any{
 									"success":      true,
 									"procedimento": targetProc.Name,
@@ -1065,10 +1138,6 @@ func (rt *Runtime) RunSessionWithOptions(
 									"instrucoes":   expanded.ExpandedContent,
 								}
 								_ = getProvSess().SendToolResult(fc, res)
-								_ = sendJSON(serverMessage{Type: "procedure_activated", Text: targetProc.Name})
-								_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "procedure_activated", map[string]any{
-									"procedure_id": targetProc.ID, "name": targetProc.Name,
-								})
 								_ = rt.Store.RecordToolExecution(sessionCtx, store.ToolExecution{
 									OrganizationID:  orgID,
 									AgentID:         agentID,
@@ -1432,11 +1501,14 @@ func (rt *Runtime) RunSessionWithOptions(
 						activeProcedures = newActiveProcedures
 						entryProcedures = newEntryProcedures
 						registeredTools = newRegisteredTools
+						procMu.Lock()
 						recentActivatedProcs = nil
+						activatedProcIDs = make(map[string]bool)
 						activeAllowedTools = make(map[string]bool)
 						for tName := range newRegisteredTools {
 							activeAllowedTools[tName] = true
 						}
+						procMu.Unlock()
 						turnAgentAudioBytes = 0
 						turnHadToolCall = false
 						currentTurnAgentText.Reset()
@@ -1463,6 +1535,27 @@ func (rt *Runtime) RunSessionWithOptions(
 						}
 						continue
 					} else if targetTool, ok := registeredTools[fc.Name]; ok {
+						// Se a ferramenta chamada pertence a um procedure que ainda não foi marcado como ativado, ativa-o automaticamente
+						for _, p := range activeProcedures {
+							meta := procedures.InspectProcedure(store.Procedure{
+								ID:      p.ID,
+								Name:    p.Name,
+								Type:    p.Type,
+								Trigger: p.Trigger,
+								Content: p.Content,
+							}, procsMap, nil, nil)
+							for _, refToolID := range meta.ReferencedToolIDs {
+								if refToolID == targetTool.ID || strings.EqualFold(refToolID, targetTool.Name) {
+									procMu.Lock()
+									already := activatedProcIDs[p.ID]
+									procMu.Unlock()
+									if !already {
+										_, _, _ = activateProcedure(p)
+									}
+								}
+							}
+						}
+
 						// Checa allowlist do Procedure ativo
 						hasSpecificTools := false
 						for tName := range activeAllowedTools {
@@ -1711,6 +1804,141 @@ func normalizeCallerTranscriptPT(text, lang string) string {
 		return "Já."
 	case "now.", "now!", "now":
 		return "Não."
+	case "comarido", "comarido.", "comarido!":
+		return "Com o marido."
+	}
+	if strings.Contains(strings.ToLower(text), "comarido") {
+		text = strings.ReplaceAll(text, "comarido", "com o marido")
+		text = strings.ReplaceAll(text, "Comarido", "Com o marido")
 	}
 	return text
+}
+
+var triggerStopwords = map[string]bool{
+	"quando": true, "cliente": true, "solicitar": true, "pedir": true, "sobre": true,
+	"para": true, "como": true, "pelo": true, "pela": true, "este": true, "esta": true,
+	"falar": true, "dizer": true, "informar": true, "fornecer": true, "atendimento": true,
+	"servico": true, "exija": true, "assunto": true, "topico": true, "duvidas": true,
+	"tiver": true, "quiser": true, "necessitar": true, "desejar": true, "precisar": true,
+	"algum": true, "qualquer": true, "uma": true, "uns": true, "umas": true, "dos": true,
+	"das": true, "nos": true, "nas": true, "com": true, "sem": true, "por": true, "que": true,
+	"seu": true, "sua": true, "meu": true, "minha": true, "usuario": true, "beneficiario": true,
+}
+
+func foldDiacriticsPT(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	repl := strings.NewReplacer(
+		"á", "a", "à", "a", "â", "a", "ã", "a",
+		"é", "e", "ê", "e",
+		"í", "i",
+		"ó", "o", "ô", "o", "õ", "o",
+		"ú", "u", "ü", "u",
+		"ç", "c",
+	)
+	return repl.Replace(s)
+}
+
+func tokenizeTriggerWords(s string) []string {
+	folded := foldDiacriticsPT(s)
+	var token strings.Builder
+	var out []string
+	flush := func() {
+		if token.Len() >= 3 {
+			w := token.String()
+			if !triggerStopwords[w] {
+				out = append(out, w)
+			}
+		}
+		token.Reset()
+	}
+	for _, r := range folded {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			token.WriteRune(r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	return out
+}
+
+// matchProceduresByCallerTranscript avalia a fala atual do Caller contra o Nome, Trigger e domínio dos procedures ativos.
+func matchProceduresByCallerTranscript(callerText string, procs []store.ProcedureSnapshot) []store.ProcedureSnapshot {
+	foldedCaller := foldDiacriticsPT(callerText)
+	if len(foldedCaller) < 3 {
+		return nil
+	}
+	callerTokens := tokenizeTriggerWords(callerText)
+	callerSet := make(map[string]bool, len(callerTokens))
+	digitCount := 0
+	for _, r := range foldedCaller {
+		if r >= '0' && r <= '9' {
+			digitCount++
+		}
+	}
+	for _, t := range callerTokens {
+		callerSet[t] = true
+	}
+
+	var matched []store.ProcedureSnapshot
+	for _, p := range procs {
+		if !p.Active {
+			continue
+		}
+		procSpec := foldDiacriticsPT(p.Name + " " + p.Trigger)
+		procContent := foldDiacriticsPT(p.Content)
+		procTokens := tokenizeTriggerWords(p.Name + " " + p.Trigger)
+
+		isMatch := false
+		for _, pt := range procTokens {
+			if callerSet[pt] {
+				isMatch = true
+				break
+			}
+			// Correspondência por radical (>= 5 letras, ex: "boletos" <-> "boleto", "cadastral" <-> "cadastro")
+			if len(pt) >= 5 {
+				stem := pt[:5]
+				for ct := range callerSet {
+					if len(ct) >= 5 && strings.HasPrefix(ct, stem) {
+						isMatch = true
+						break
+					}
+				}
+			}
+			if isMatch {
+				break
+			}
+		}
+
+		// Regras semânticas de domínio para Boletos/Financeiro e Identificação/Autorização/Terceiros/CPF
+		if !isMatch {
+			if strings.Contains(procSpec, "boleto") || strings.Contains(procSpec, "segunda via") || strings.Contains(procSpec, "financeiro") {
+				for _, kw := range []string{"boleto", "segunda via", "2 via", "2a via", "fatura", "mensalidade", "pagamento", "pagar", "vencimento", "cobranca", "codigo de barras"} {
+					if strings.Contains(foldedCaller, kw) {
+						isMatch = true
+						break
+					}
+				}
+			}
+		}
+		if !isMatch {
+			if strings.Contains(procSpec, "identificacao") || strings.Contains(procSpec, "autorizacao") || strings.Contains(procSpec, "cpf") || strings.Contains(procSpec, "cadastr") || strings.Contains(procContent, "terceiro") || strings.Contains(procContent, "dependente") {
+				if digitCount >= 3 {
+					isMatch = true
+				} else {
+					for _, kw := range []string{"cpf", "cadastro", "cadastral", "marido", "esposa", "esposo", "mae", "pai", "filho", "filha", "dependente", "parente", "terceiro", "titular"} {
+						if strings.Contains(foldedCaller, kw) {
+							isMatch = true
+							break
+						}
+					}
+				}
+			}
+		}
+
+		if isMatch {
+			matched = append(matched, p)
+		}
+	}
+	return matched
 }
