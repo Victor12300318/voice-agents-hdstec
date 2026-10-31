@@ -100,7 +100,84 @@ func (s *Store) ListProcedures(ctx context.Context, orgID, agentID string) ([]Pr
 		}
 		out = append(out, p)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		if recovered := s.recoverProceduresFromVersions(ctx, orgID, agentID); len(recovered) > 0 {
+			return recovered, nil
+		}
+	}
+	return out, nil
+}
+
+// recoverProceduresFromVersions restaura procedures a partir do último snapshot de agent_branch_drafts ou agent_versions
+// caso um publish anterior com branch draft desatualizado tenha limpado a tabela procedures.
+func (s *Store) recoverProceduresFromVersions(ctx context.Context, orgID, agentID string) []Procedure {
+	var raw []byte
+	err := s.Pool.QueryRow(ctx, `
+		SELECT snapshot FROM (
+			SELECT snapshot, updated_at AS ts, 1 AS prio
+			FROM agent_branch_drafts
+			WHERE organization_id = $1 AND agent_id = $2
+			  AND jsonb_typeof(snapshot->'procedures') = 'array'
+			  AND jsonb_array_length(snapshot->'procedures') > 0
+			UNION ALL
+			SELECT snapshot, created_at AS ts, 2 AS prio
+			FROM agent_versions
+			WHERE organization_id = $1 AND agent_id = $2
+			  AND jsonb_typeof(snapshot->'procedures') = 'array'
+			  AND jsonb_array_length(snapshot->'procedures') > 0
+		) sub
+		ORDER BY prio ASC, ts DESC
+		LIMIT 1`, orgID, agentID).Scan(&raw)
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	var snap AgentConfig
+	if err := json.Unmarshal(raw, &snap); err != nil || len(snap.Procedures) == 0 {
+		return nil
+	}
+	var restored []Procedure
+	for i, sp := range snap.Procedures {
+		guardBytes, _ := json.Marshal(sp.Guardrails)
+		pType := sp.Type
+		if pType == "" {
+			pType = "free_form"
+		}
+		var p Procedure
+		var scanErr error
+		if sp.ID != "" {
+			row := s.Pool.QueryRow(ctx, `
+				INSERT INTO procedures (id, organization_id, agent_id, name, type, trigger, guardrails, content, active, position)
+				VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				ON CONFLICT (id) DO UPDATE SET
+					name = EXCLUDED.name,
+					type = EXCLUDED.type,
+					trigger = EXCLUDED.trigger,
+					guardrails = EXCLUDED.guardrails,
+					content = EXCLUDED.content,
+					active = EXCLUDED.active,
+					position = EXCLUDED.position,
+					updated_at = now()
+				WHERE procedures.agent_id = EXCLUDED.agent_id
+				RETURNING `+procCols,
+				sp.ID, orgID, agentID, sp.Name, pType, sp.Trigger, guardBytes, sp.Content, sp.Active, i+1)
+			p, scanErr = scanProc(row)
+		}
+		if sp.ID == "" || scanErr != nil {
+			row := s.Pool.QueryRow(ctx, `
+				INSERT INTO procedures (organization_id, agent_id, name, type, trigger, guardrails, content, active, position)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				RETURNING `+procCols,
+				orgID, agentID, sp.Name, pType, sp.Trigger, guardBytes, sp.Content, sp.Active, i+1)
+			p, scanErr = scanProc(row)
+		}
+		if scanErr == nil {
+			restored = append(restored, p)
+		}
+	}
+	return restored
 }
 
 func (s *Store) DeleteProcedure(ctx context.Context, orgID, agentID, id string) error {

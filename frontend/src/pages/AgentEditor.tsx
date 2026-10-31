@@ -436,7 +436,8 @@ export default function AgentEditor() {
         setActiveBranchId(ag.current_branch.id)
       }
       setAvailableTools(tls || [])
-      setSkills(procs || [])
+      const fallbackSnapProcs = ((ag as any).active_procedures_snapshot as Skill[] | undefined) || []
+      setSkills(procs && procs.length > 0 ? procs : fallbackSnapProcs)
       setKnowledgeBases(kbs || [])
       setVersionsList(vers || [])
       setHasUnsavedDraft(Boolean(ag.has_unpublished_changes))

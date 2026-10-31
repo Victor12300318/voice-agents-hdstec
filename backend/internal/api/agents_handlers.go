@@ -301,13 +301,16 @@ func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request) {
 			a = updated
 		}
 
-		// Preserva procedures atuais da branch/draft no snapshot salvo
+		// Carrega procedures atuais da tabela procedures (fonte da verdade do editor de procedures);
+		// só usa snapshot da branch se a tabela principal não tiver procedures e a branch secundária tiver.
 		baseCfg, _ := s.Store.DraftConfig(r.Context(), a.OrganizationID, a)
-		if existingDraft, _, err := s.Store.GetBranchDraft(r.Context(), a.OrganizationID, a.ID, b.ID, sess.UserID); err == nil && existingDraft != nil {
-			baseCfg.Procedures = existingDraft.Procedures
-		} else if b.HeadVersionID != nil {
-			if hv, err := s.Store.GetVersionByRef(r.Context(), a.OrganizationID, a.ID, *b.HeadVersionID); err == nil {
-				baseCfg.Procedures = hv.Snapshot.Procedures
+		if len(baseCfg.Procedures) == 0 && !b.IsMain {
+			if existingDraft, _, err := s.Store.GetBranchDraft(r.Context(), a.OrganizationID, a.ID, b.ID, sess.UserID); err == nil && existingDraft != nil && len(existingDraft.Procedures) > 0 {
+				baseCfg.Procedures = existingDraft.Procedures
+			} else if b.HeadVersionID != nil {
+				if hv, err := s.Store.GetVersionByRef(r.Context(), a.OrganizationID, a.ID, *b.HeadVersionID); err == nil && len(hv.Snapshot.Procedures) > 0 {
+					baseCfg.Procedures = hv.Snapshot.Procedures
+				}
 			}
 		}
 
@@ -393,11 +396,18 @@ func (s *Server) publishAgent(w http.ResponseWriter, r *http.Request) {
 		if targetBranch == "" {
 			targetBranch = "Main"
 		}
+		liveProcs := cfg.Procedures
 		if draftCfg, _, err := s.Store.GetBranchDraft(r.Context(), sess.OrganizationID, a.ID, targetBranch, sess.UserID); err == nil && draftCfg != nil {
 			cfg = *draftCfg
+			if len(liveProcs) > 0 {
+				cfg.Procedures = liveProcs
+			}
 		} else if b, err := s.Store.GetBranch(r.Context(), sess.OrganizationID, a.ID, targetBranch, sess.UserID); err == nil && !b.IsMain && b.HeadVersionID != nil {
 			if hv, err := s.Store.GetVersionByRef(r.Context(), sess.OrganizationID, a.ID, *b.HeadVersionID); err == nil {
 				cfg = hv.Snapshot
+				if len(liveProcs) > 0 {
+					cfg.Procedures = liveProcs
+				}
 			}
 		}
 	}

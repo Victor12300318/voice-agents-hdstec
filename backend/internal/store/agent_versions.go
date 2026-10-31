@@ -206,6 +206,21 @@ func (s *Store) DraftConfig(ctx context.Context, orgID string, a Agent) (AgentCo
 	if err := rows.Err(); err != nil {
 		return cfg, err
 	}
+	if len(cfg.Procedures) == 0 {
+		if recovered := s.recoverProceduresFromVersions(ctx, orgID, a.ID); len(recovered) > 0 {
+			for _, rp := range recovered {
+				cfg.Procedures = append(cfg.Procedures, ProcedureSnapshot{
+					ID:         rp.ID,
+					Name:       rp.Name,
+					Type:       rp.Type,
+					Trigger:    rp.Trigger,
+					Guardrails: rp.Guardrails,
+					Content:    rp.Content,
+					Active:     rp.Active,
+				})
+			}
+		}
+	}
 	texts := []string{cfg.SystemPrompt, cfg.FirstMessage}
 	for _, p := range cfg.Procedures {
 		texts = append(texts, p.Content, p.Trigger)

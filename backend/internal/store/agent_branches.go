@@ -135,23 +135,52 @@ func syncMainTablesTx(ctx context.Context, tx pgx.Tx, orgID, agentID string, cfg
 		return err
 	}
 
-	// Sincroniza procedures da tabela principal com o snapshot da Main
-	_, err = tx.Exec(ctx, `DELETE FROM procedures WHERE organization_id=$1 AND agent_id=$2`, orgID, agentID)
-	if err != nil {
-		return err
-	}
-	for i, p := range cfg.Procedures {
-		guardBytes, _ := json.Marshal(p.Guardrails)
-		pType := p.Type
-		if pType == "" {
-			pType = "free_form"
-		}
-		_, err = tx.Exec(ctx, `
-			INSERT INTO procedures (organization_id, agent_id, name, type, trigger, guardrails, content, active, position)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-			orgID, agentID, p.Name, pType, p.Trigger, guardBytes, p.Content, p.Active, i+1)
+	// Sincroniza procedures da tabela principal com o snapshot da Main apenas quando o snapshot contiver procedures,
+	// preservando os IDs existentes para não quebrar referências [procedure id="..."].
+	if len(cfg.Procedures) > 0 {
+		_, err = tx.Exec(ctx, `DELETE FROM procedures WHERE organization_id=$1 AND agent_id=$2`, orgID, agentID)
 		if err != nil {
 			return err
+		}
+		for i, p := range cfg.Procedures {
+			guardBytes, _ := json.Marshal(p.Guardrails)
+			pType := p.Type
+			if pType == "" {
+				pType = "free_form"
+			}
+			inserted := false
+			if p.ID != "" {
+				var existingAgentID string
+				errOwner := tx.QueryRow(ctx, `SELECT agent_id::text FROM procedures WHERE id = $1::uuid`, p.ID).Scan(&existingAgentID)
+				if errors.Is(errOwner, pgx.ErrNoRows) || existingAgentID == agentID {
+					_, err = tx.Exec(ctx, `
+						INSERT INTO procedures (id, organization_id, agent_id, name, type, trigger, guardrails, content, active, position)
+						VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+						ON CONFLICT (id) DO UPDATE SET
+							name = EXCLUDED.name,
+							type = EXCLUDED.type,
+							trigger = EXCLUDED.trigger,
+							guardrails = EXCLUDED.guardrails,
+							content = EXCLUDED.content,
+							active = EXCLUDED.active,
+							position = EXCLUDED.position,
+							updated_at = now()`,
+						p.ID, orgID, agentID, p.Name, pType, p.Trigger, guardBytes, p.Content, p.Active, i+1)
+					if err != nil {
+						return err
+					}
+					inserted = true
+				}
+			}
+			if !inserted {
+				_, err = tx.Exec(ctx, `
+					INSERT INTO procedures (organization_id, agent_id, name, type, trigger, guardrails, content, active, position)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					orgID, agentID, p.Name, pType, p.Trigger, guardBytes, p.Content, p.Active, i+1)
+				if err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil
@@ -683,6 +712,9 @@ func (s *Store) RouteVersionForConversation(ctx context.Context, orgID string, a
 			}
 			if chosen != nil && chosen.HeadVersionID != nil {
 				if ver, err := s.GetVersionByRef(ctx, orgID, ag.ID, *chosen.HeadVersionID); err == nil {
+					if draftCfg, dErr := s.DraftConfig(ctx, orgID, ag); dErr == nil && len(draftCfg.Procedures) > 0 {
+						ver.Snapshot.Procedures = draftCfg.Procedures
+					}
 					bID := chosen.ID
 					return ver.Snapshot, &ver.ID, &bID, nil
 				}
@@ -692,6 +724,9 @@ func (s *Store) RouteVersionForConversation(ctx context.Context, orgID string, a
 
 	v, err := s.LatestVersion(ctx, orgID, ag.ID)
 	if err == nil {
+		if draftCfg, dErr := s.DraftConfig(ctx, orgID, ag); dErr == nil && len(draftCfg.Procedures) > 0 {
+			v.Snapshot.Procedures = draftCfg.Procedures
+		}
 		return v.Snapshot, &v.ID, v.BranchID, nil
 	}
 	cfg, err := s.DraftConfig(ctx, orgID, ag)

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"unicode/utf8"
@@ -127,6 +128,7 @@ func (s *Server) createProcedure(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	all, _ := s.Store.ListProcedures(r.Context(), orgID, agent.ID)
+	s.syncAgentProceduresToDrafts(r.Context(), orgID, agent)
 	enriched := s.enrichProcedures(r.Context(), orgID, all)
 	for _, item := range enriched {
 		if item.ID == created.ID {
@@ -178,6 +180,7 @@ func (s *Server) importSOPProcedures(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err)
 		return
 	}
+	s.syncAgentProceduresToDrafts(r.Context(), orgID, agent)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"imported_count": len(createdIDs),
 		"procedures":     s.enrichProcedures(r.Context(), orgID, all),
@@ -243,6 +246,7 @@ func (s *Server) updateProcedure(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	all, _ := s.Store.ListProcedures(r.Context(), orgID, agent.ID)
+	s.syncAgentProceduresToDrafts(r.Context(), orgID, agent)
 	enriched := s.enrichProcedures(r.Context(), orgID, all)
 	for _, item := range enriched {
 		if item.ID == updated.ID {
@@ -268,5 +272,24 @@ func (s *Server) deleteProcedure(w http.ResponseWriter, r *http.Request) {
 		s.notFoundOr(w, r, err)
 		return
 	}
+	s.syncAgentProceduresToDrafts(r.Context(), orgID, agent)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// syncAgentProceduresToDrafts mantém os rascunhos de branches sincronizados quando procedures são criados, editados ou removidos.
+func (s *Server) syncAgentProceduresToDrafts(ctx context.Context, orgID string, agent store.Agent) {
+	cfg, err := s.Store.DraftConfig(ctx, orgID, agent)
+	if err != nil {
+		return
+	}
+	procsBytes, err := json.Marshal(cfg.Procedures)
+	if err != nil {
+		return
+	}
+	_, _ = s.Store.Pool.Exec(ctx, `
+		UPDATE agent_branch_drafts
+		SET snapshot = jsonb_set(snapshot, '{procedures}', $3::jsonb, true),
+		    updated_at = now()
+		WHERE organization_id = $1 AND agent_id = $2`,
+		orgID, agent.ID, procsBytes)
 }

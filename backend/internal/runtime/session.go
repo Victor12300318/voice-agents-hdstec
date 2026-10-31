@@ -234,19 +234,66 @@ func (rt *Runtime) RunSessionWithOptions(
 	}
 
 	// 4. Carrega Procedures e monta índice de Triggers (ADR 0001 + Sub-procedures ElevenLabs)
+	if len(cfg.Procedures) == 0 {
+		if draftCfg, dErr := rt.Store.DraftConfig(ctx, orgID, store.Agent{ID: agentID, OrganizationID: orgID}); dErr == nil && len(draftCfg.Procedures) > 0 {
+			cfg.Procedures = draftCfg.Procedures
+		}
+	}
+
 	procsMap := make(map[string]store.ProcedureSnapshot)
 	var activeProcedures []store.ProcedureSnapshot
-	var entryProcedures []store.ProcedureSnapshot
-	for _, p := range cfg.Procedures {
-		if p.Active {
-			procsMap[p.ID] = p
-			activeProcedures = append(activeProcedures, p)
-			// Sub-procedures têm Trigger vazio e só podem ser acionados por referência de outro Procedure
-			if strings.TrimSpace(p.Trigger) != "" {
-				entryProcedures = append(entryProcedures, p)
+	for _, rawProc := range cfg.Procedures {
+		if !rawProc.Active {
+			continue
+		}
+		p := rawProc
+		p.Trigger = variables.Render(p.Trigger, allVars)
+		p.Content = variables.Render(p.Content, allVars)
+		if len(p.Guardrails) > 0 {
+			renderedGuards := make([]string, len(p.Guardrails))
+			for i, g := range p.Guardrails {
+				renderedGuards[i] = variables.Render(g, allVars)
+			}
+			p.Guardrails = renderedGuards
+		}
+		procsMap[p.ID] = p
+		activeProcedures = append(activeProcedures, p)
+	}
+
+	// Identifica quais procedures são referenciados como sub-procedures por outros procedures
+	referencedAsSubProc := make(map[string]bool)
+	for _, p := range activeProcedures {
+		meta := procedures.InspectProcedure(store.Procedure{
+			ID:      p.ID,
+			Name:    p.Name,
+			Type:    p.Type,
+			Trigger: p.Trigger,
+			Content: p.Content,
+		}, procsMap, nil, nil)
+		for _, refID := range meta.ReferencedProcedureIDs {
+			referencedAsSubProc[refID] = true
+			for _, cand := range activeProcedures {
+				if strings.EqualFold(strings.TrimSpace(cand.Name), strings.TrimSpace(refID)) {
+					referencedAsSubProc[cand.ID] = true
+				}
 			}
 		}
 	}
+
+	var entryProcedures []store.ProcedureSnapshot
+	for _, p := range activeProcedures {
+		if strings.TrimSpace(p.Trigger) != "" {
+			entryProcedures = append(entryProcedures, p)
+		} else if !referencedAsSubProc[p.ID] {
+			p.Trigger = "Quando o atendimento envolver " + p.Name
+			entryProcedures = append(entryProcedures, p)
+		}
+	}
+
+	executor := tools.NewExecutor(rt.HTTPClient)
+	procExpander := procedures.NewExpander(rt.Store)
+	promptReferencedTools := make(map[string]bool)
+	systemPrompt = procExpander.ExpandInlineReferences(ctx, orgID, systemPrompt, procsMap, promptReferencedTools)
 
 	var toolSpecs []voice.ToolSpec
 	registeredTools := make(map[string]store.Tool)
@@ -328,15 +375,25 @@ func (rt *Runtime) RunSessionWithOptions(
 		})
 
 		var triggerIndex strings.Builder
-		triggerIndex.WriteString("\n\n## PROCEDIMENTOS DISPONÍVEIS:\nQuando a solicitação do usuário corresponder a um dos tópicos abaixo, chame a ferramenta \"ativar_procedure\" passando o nome do procedimento:\n")
+		triggerIndex.WriteString("\n\n## PROCEDIMENTOS DO AGENTE (SIGA RIGOROSAMENTE QUANDO APLICÁVEL):\n")
+		triggerIndex.WriteString("Quando a solicitação do usuário corresponder a um dos procedimentos abaixo, siga suas diretrizes e passos (e chame \"ativar_procedure\" passando o nome do procedimento):\n")
 		for _, p := range entryProcedures {
-			triggerIndex.WriteString(fmt.Sprintf("- \"%s\": %s\n", p.Name, p.Trigger))
+			triggerIndex.WriteString(fmt.Sprintf("\n### PROCEDIMENTO: %q\n- **Quando acionar (Trigger):** %s\n", p.Name, p.Trigger))
+			if expanded, expErr := procExpander.ExpandProcedure(ctx, orgID, agentID, p, procsMap); expErr == nil && strings.TrimSpace(expanded.ExpandedContent) != "" {
+				triggerIndex.WriteString(expanded.ExpandedContent)
+				triggerIndex.WriteString("\n")
+				for tName, ok := range expanded.AllowedTools {
+					if ok {
+						promptReferencedTools[tName] = true
+					}
+				}
+			} else if strings.TrimSpace(p.Content) != "" {
+				triggerIndex.WriteString(p.Content)
+				triggerIndex.WriteString("\n")
+			}
 		}
 		systemPrompt += triggerIndex.String()
 	}
-
-	executor := tools.NewExecutor(rt.HTTPClient)
-	procExpander := procedures.NewExpander(rt.Store)
 
 	registerToolByID := func(toolID string) {
 		if toolID == "" || addedToolIDs[toolID] {
@@ -475,11 +532,19 @@ func (rt *Runtime) RunSessionWithOptions(
 			activeAllowedTools[name] = true
 		}
 	} else {
-		// Ferramentas anexadas globalmente ao agente ficam sempre permitidas, além das anexadas por cada procedure
+		// Ferramentas anexadas globalmente ao agente ou referenciadas em procedures ativos ficam permitidas
 		for _, globalToolID := range cfg.Tools {
 			if t, err := rt.Store.GetTool(ctx, orgID, globalToolID); err == nil {
 				activeAllowedTools[t.Name] = true
 			}
+		}
+		for tName, ok := range promptReferencedTools {
+			if ok {
+				activeAllowedTools[tName] = true
+			}
+		}
+		for name := range registeredTools {
+			activeAllowedTools[name] = true
 		}
 	}
 
@@ -1223,15 +1288,29 @@ func (rt *Runtime) RunSessionWithOptions(
 						newProcsMap := make(map[string]store.ProcedureSnapshot)
 						var newActiveProcedures []store.ProcedureSnapshot
 						var newEntryProcedures []store.ProcedureSnapshot
-						for _, p := range targetCfg.Procedures {
-							if p.Active {
+						for _, rawP := range targetCfg.Procedures {
+							if rawP.Active {
+								p := rawP
+								p.Trigger = variables.Render(p.Trigger, allVars)
+								p.Content = variables.Render(p.Content, allVars)
+								if len(p.Guardrails) > 0 {
+									rg := make([]string, len(p.Guardrails))
+									for i, g := range p.Guardrails {
+										rg[i] = variables.Render(g, allVars)
+									}
+									p.Guardrails = rg
+								}
 								newProcsMap[p.ID] = p
 								newActiveProcedures = append(newActiveProcedures, p)
 								if strings.TrimSpace(p.Trigger) != "" {
 									newEntryProcedures = append(newEntryProcedures, p)
+								} else {
+									p.Trigger = "Quando o atendimento envolver " + p.Name
+									newEntryProcedures = append(newEntryProcedures, p)
 								}
 							}
 						}
+						childPrompt = procExpander.ExpandInlineReferences(sessionCtx, orgID, childPrompt, newProcsMap, nil)
 
 						var childToolSpecs []voice.ToolSpec
 						newRegisteredTools := make(map[string]store.Tool)
@@ -1281,20 +1360,42 @@ func (rt *Runtime) RunSessionWithOptions(
 								Parameters:  []voice.Param{{Name: "nome", Type: "string", Description: "Nome do procedimento", Required: true}},
 							})
 							var trigSb strings.Builder
-							trigSb.WriteString("\n\n## PROCEDIMENTOS DISPONÍVEIS:\n")
+							trigSb.WriteString("\n\n## PROCEDIMENTOS DO AGENTE (SIGA RIGOROSAMENTE QUANDO APLICÁVEL):\n")
 							for _, p := range newEntryProcedures {
-								trigSb.WriteString(fmt.Sprintf("- \"%s\": %s\n", p.Name, p.Trigger))
+								trigSb.WriteString(fmt.Sprintf("\n### PROCEDIMENTO: %q\n- **Quando acionar (Trigger):** %s\n", p.Name, p.Trigger))
+								if expanded, expErr := procExpander.ExpandProcedure(sessionCtx, orgID, targetAgent.ID, p, newProcsMap); expErr == nil && strings.TrimSpace(expanded.ExpandedContent) != "" {
+									trigSb.WriteString(expanded.ExpandedContent)
+									trigSb.WriteString("\n")
+								} else if strings.TrimSpace(p.Content) != "" {
+									trigSb.WriteString(p.Content)
+									trigSb.WriteString("\n")
+								}
 							}
 							childPrompt += trigSb.String()
 						}
 
-						for _, tid := range targetCfg.Tools {
+						registerChildTool := func(tid string) {
 							if tid != "" && !newAddedToolIDs[tid] {
 								if t, err := rt.Store.GetTool(sessionCtx, orgID, tid); err == nil && t.Active {
 									newAddedToolIDs[tid] = true
 									childToolSpecs = append(childToolSpecs, voice.ToolSpec{Name: t.Name, Description: t.Description, Parameters: t.InputSchema})
 									newRegisteredTools[t.Name] = t
 								}
+							}
+						}
+						for _, tid := range targetCfg.Tools {
+							registerChildTool(tid)
+						}
+						for _, p := range newActiveProcedures {
+							meta := procedures.InspectProcedure(store.Procedure{
+								ID:      p.ID,
+								Name:    p.Name,
+								Type:    p.Type,
+								Trigger: p.Trigger,
+								Content: p.Content,
+							}, newProcsMap, nil, nil)
+							for _, refToolID := range meta.ReferencedToolIDs {
+								registerChildTool(refToolID)
 							}
 						}
 

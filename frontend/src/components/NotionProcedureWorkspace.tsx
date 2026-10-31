@@ -153,6 +153,15 @@ export default function NotionProcedureWorkspace({
     }
   }, [agentProcedures])
 
+  // Auto-save com debounce quando o procedimento ativo possui alterações pendentes (dirty)
+  useEffect(() => {
+    if (!dirty || !activeProc || saving) return
+    const timer = setTimeout(() => {
+      handleSave()
+    }, 900)
+    return () => clearTimeout(timer)
+  }, [dirty, activeProc, title, triggerEnabled, triggerText, guardrails, content])
+
   const selectProcedure = (p: Skill) => {
     setActiveProcId(p.id)
     setTitle(p.name)

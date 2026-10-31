@@ -290,9 +290,19 @@ func (e *Expander) expandContent(
 			}
 			subProc, ok := allProcs[id]
 			if !ok {
+				for _, candidate := range allProcs {
+					if strings.EqualFold(strings.TrimSpace(candidate.Name), strings.TrimSpace(id)) {
+						subProc = candidate
+						ok = true
+						break
+					}
+				}
+			}
+			if !ok {
 				return rawMatch
 			}
 			visited[id] = true
+			visited[subProc.ID] = true
 			if subProc.Type == "deterministic" {
 				if doc, err := ParseStructured(subProc.Content); err == nil {
 					toolsByID := map[string]store.Tool{}
@@ -348,4 +358,25 @@ func (e *Expander) expandContent(
 	})
 
 	return expanded, nil
+}
+
+// ExpandInlineReferences expande referências [procedure id="..."], [kb id="..."], [tool id="..."] diretamente em um texto (ex: System Prompt).
+func (e *Expander) ExpandInlineReferences(
+	ctx context.Context,
+	orgID string,
+	text string,
+	allProcs map[string]store.ProcedureSnapshot,
+	allowedTools map[string]bool,
+) string {
+	if strings.TrimSpace(text) == "" {
+		return text
+	}
+	if allowedTools == nil {
+		allowedTools = map[string]bool{}
+	}
+	expanded, err := e.expandContent(ctx, orgID, text, allProcs, map[string]bool{}, allowedTools, 0)
+	if err != nil {
+		return text
+	}
+	return expanded
 }

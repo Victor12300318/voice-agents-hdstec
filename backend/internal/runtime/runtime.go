@@ -182,6 +182,7 @@ func (rt *Runtime) ServeWS(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "erro ao carregar draft", http.StatusInternalServerError)
 			return
 		}
+		liveProcs := cfg.Procedures
 		if agent.VersioningEnabled && branchParam != "" {
 			if draftCfg, _, dErr := rt.Store.GetBranchDraft(r.Context(), userSess.OrganizationID, agent.ID, branchParam, userSess.UserID); dErr == nil && draftCfg != nil {
 				cfg = *draftCfg
@@ -189,6 +190,9 @@ func (rt *Runtime) ServeWS(w http.ResponseWriter, r *http.Request) {
 				if hv, vErr := rt.Store.GetVersionByRef(r.Context(), userSess.OrganizationID, agent.ID, *b.HeadVersionID); vErr == nil {
 					cfg = hv.Snapshot
 				}
+			}
+			if len(liveProcs) > 0 {
+				cfg.Procedures = liveProcs
 			}
 		}
 	} else if branchParam != "" && (versionParam == "" || versionParam == "tip") {
@@ -205,6 +209,11 @@ func (rt *Runtime) ServeWS(w http.ResponseWriter, r *http.Request) {
 		}
 		versionID = &hv.ID
 		cfg = hv.Snapshot
+		if len(cfg.Procedures) == 0 {
+			if draftCfg, dErr := rt.Store.DraftConfig(r.Context(), userSess.OrganizationID, agent); dErr == nil && len(draftCfg.Procedures) > 0 {
+				cfg.Procedures = draftCfg.Procedures
+			}
+		}
 	} else {
 		isTest = false
 		if versionParam == "latest" {
@@ -226,6 +235,11 @@ func (rt *Runtime) ServeWS(w http.ResponseWriter, r *http.Request) {
 			}
 			versionID = &v.ID
 			cfg = v.Snapshot
+		}
+		if len(cfg.Procedures) == 0 {
+			if draftCfg, dErr := rt.Store.DraftConfig(r.Context(), userSess.OrganizationID, agent); dErr == nil && len(draftCfg.Procedures) > 0 {
+				cfg.Procedures = draftCfg.Procedures
+			}
 		}
 	}
 
