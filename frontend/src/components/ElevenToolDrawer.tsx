@@ -104,6 +104,13 @@ export default function ElevenToolDrawer({
   >('no_approval')
   const [mcpSecretToken, setMcpSecretToken] = useState('')
   const [mcpParams, setMcpParams] = useState<ToolParamSchema[]>([])
+  const [discoveringMcp, setDiscoveringMcp] = useState(false)
+  const [mcpDiscoverResult, setMcpDiscoverResult] = useState<{
+    connected: boolean
+    transport?: string
+    error?: string
+    tools?: { name: string; description?: string; inputSchema?: any }[]
+  } | null>(null)
 
   // Campos específicos: Code Tool
   const [codeSource, setCodeSource] = useState<string>(DEFAULT_CODE_TEMPLATE)
@@ -140,6 +147,7 @@ export default function ElevenToolDrawer({
     setJsonError('')
     setIsJsonMode(false)
     setAdvancedOpen(false)
+    setMcpDiscoverResult(null)
 
     if (editingTool) {
       const k = ((editingTool.kind as ToolCategory) || 'webhook')
@@ -693,6 +701,57 @@ export default function ElevenToolDrawer({
     }
   }
 
+  const buildMcpSecretHeaders = () => {
+    const secHeaders: Record<string, string> = {}
+    for (const h of requestHeaders) {
+      if (h.name.trim() && h.value.trim()) {
+        secHeaders[h.name.trim()] = h.value.trim()
+      }
+    }
+    const tok = mcpSecretToken.trim()
+    if (tok) {
+      secHeaders['Authorization'] = /^(Bearer|Basic|ApiKey)\s+/i.test(tok) ? tok : `Bearer ${tok}`
+    }
+    return secHeaders
+  }
+
+  const handleDiscoverMcp = async () => {
+    if (!url.trim()) {
+      setErrorMsg('Informe a URL do servidor MCP para testar a conexão.')
+      return
+    }
+    setDiscoveringMcp(true)
+    setMcpDiscoverResult(null)
+    setErrorMsg('')
+    try {
+      const secHeaders = buildMcpSecretHeaders()
+      const res = await api<{
+        connected: boolean
+        transport?: string
+        error?: string
+        tools?: { name: string; description?: string; inputSchema?: any }[]
+      }>('/api/tools/mcp/discover', {
+        method: 'POST',
+        body: JSON.stringify({
+          tool_id: editingTool?.id || '',
+          url: url.trim(),
+          transport: mcpTransport,
+          request_headers: requestHeaders,
+          secret_headers: Object.keys(secHeaders).length > 0 ? secHeaders : undefined,
+        }),
+      })
+      setMcpDiscoverResult(res)
+    } catch (err: any) {
+      setMcpDiscoverResult({
+        connected: false,
+        error: err?.message || 'Falha ao conectar no servidor MCP',
+        tools: [],
+      })
+    } finally {
+      setDiscoveringMcp(false)
+    }
+  }
+
   const handleSave = async () => {
     setErrorMsg('')
     let currentObj = buildElevenLabsJsonObject()
@@ -766,9 +825,10 @@ export default function ElevenToolDrawer({
         secHeaders['X-API-Key'] = authTokenValue.trim()
       }
       if (kind === 'mcp' && mcpSecretToken.trim()) {
-        secHeaders['Authorization'] = mcpSecretToken.trim().startsWith('Bearer ')
-          ? mcpSecretToken.trim()
-          : `Bearer ${mcpSecretToken.trim()}`
+        const tok = mcpSecretToken.trim()
+        secHeaders['Authorization'] = /^(Bearer|Basic|ApiKey)\s+/i.test(tok)
+          ? tok
+          : `Bearer ${tok}`
       }
 
       const domains = followRedirectsDomains
@@ -1368,9 +1428,81 @@ export default function ElevenToolDrawer({
                           type="password"
                           value={mcpSecretToken}
                           onChange={(e) => setMcpSecretToken(e.target.value)}
-                          placeholder="Bearer ..."
+                          placeholder={
+                            editingTool?.has_secrets
+                              ? 'Token secreto já salvo (deixe em branco para manter)'
+                              : 'Bearer ...'
+                          }
                           className="w-full px-3 py-2 bg-white border border-zinc-200 rounded-lg text-xs font-mono text-zinc-900"
                         />
+                      </div>
+
+                      <div className="pt-1 space-y-2.5">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-[11px] text-zinc-500">
+                            Valide a conexão e veja quais ferramentas o agente descobrirá automaticamente via MCP (<code className="font-mono">tools/list</code>).
+                          </span>
+                          <button
+                            type="button"
+                            onClick={handleDiscoverMcp}
+                            disabled={discoveringMcp || !url.trim()}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 disabled:opacity-40 text-white text-xs font-medium transition-colors flex-shrink-0 cursor-pointer"
+                          >
+                            <Play className="w-3 h-3" />
+                            {discoveringMcp ? 'Conectando…' : 'Testar & Listar Tools'}
+                          </button>
+                        </div>
+
+                        {mcpDiscoverResult && (
+                          <div
+                            className={`p-3 rounded-xl border text-xs space-y-2 ${
+                              mcpDiscoverResult.connected
+                                ? 'bg-emerald-50/70 border-emerald-200 text-emerald-950'
+                                : 'bg-red-50 border-red-200 text-red-900'
+                            }`}
+                          >
+                            {mcpDiscoverResult.connected ? (
+                              <>
+                                <div className="font-semibold flex items-center justify-between">
+                                  <span>
+                                    Conectado ({mcpDiscoverResult.transport || mcpTransport}) —{' '}
+                                    {mcpDiscoverResult.tools?.length || 0} ferramenta(s) descoberta(s)
+                                  </span>
+                                </div>
+                                {mcpDiscoverResult.tools && mcpDiscoverResult.tools.length > 0 ? (
+                                  <div className="space-y-1.5 max-h-44 overflow-y-auto">
+                                    {mcpDiscoverResult.tools.map((rt) => (
+                                      <div
+                                        key={rt.name}
+                                        className="p-2 bg-white/90 border border-emerald-200/80 rounded-lg"
+                                      >
+                                        <div className="font-mono font-semibold text-zinc-900">
+                                          {rt.name}
+                                        </div>
+                                        {rt.description && (
+                                          <div className="text-[11px] text-zinc-600 mt-0.5 line-clamp-2">
+                                            {rt.description}
+                                          </div>
+                                        )}
+                                      </div>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <div className="text-[11px] text-amber-800">
+                                    O servidor respondeu ao handshake, mas não retornou ferramentas em tools/list.
+                                  </div>
+                                )}
+                              </>
+                            ) : (
+                              <div>
+                                <div className="font-semibold">Erro na conexão MCP</div>
+                                <div className="text-[11px] font-mono mt-1 break-all">
+                                  {mcpDiscoverResult.error}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </>
                   )}

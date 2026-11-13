@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"voiceagent/internal/auth"
@@ -11,6 +13,13 @@ import (
 	"voiceagent/internal/tools"
 	"voiceagent/internal/voice"
 )
+
+type mcpConfigPayload struct {
+	URL            string                   `json:"url"`
+	Transport      string                   `json:"transport"`
+	ApprovalPolicy string                   `json:"approval_policy"`
+	RequestHeaders []store.ToolHeaderSchema `json:"request_headers"`
+}
 
 type toolPayload struct {
 	Name          string              `json:"name"`
@@ -25,6 +34,7 @@ type toolPayload struct {
 
 	// Campos de nível superior no formato JSON nativo da ElevenLabs
 	APISchema                     *store.ToolAPISchema        `json:"api_schema,omitempty"`
+	MCPConfig                     *mcpConfigPayload           `json:"mcp_config,omitempty"`
 	ResponseTimeoutSecs           int                         `json:"response_timeout_secs,omitempty"`
 	FollowRedirects               *bool                       `json:"follow_redirects,omitempty"`
 	FollowRedirectsAllowedDomains []string                    `json:"follow_redirects_allowed_domains,omitempty"`
@@ -51,6 +61,25 @@ func normalizeToolPayload(p *toolPayload) {
 	}
 
 	// Mescla campos de nível superior do JSON ElevenLabs dentro de p.Config
+	if p.MCPConfig != nil {
+		if p.Config.URL == "" && p.MCPConfig.URL != "" {
+			p.Config.URL = strings.TrimSpace(p.MCPConfig.URL)
+		}
+		if p.Config.Transport == "" && p.MCPConfig.Transport != "" {
+			p.Config.Transport = p.MCPConfig.Transport
+		}
+		if p.Config.ApprovalPolicy == "" && p.MCPConfig.ApprovalPolicy != "" {
+			p.Config.ApprovalPolicy = p.MCPConfig.ApprovalPolicy
+		}
+		if len(p.MCPConfig.RequestHeaders) > 0 {
+			if p.Config.APISchema == nil {
+				p.Config.APISchema = &store.ToolAPISchema{}
+			}
+			if len(p.Config.APISchema.RequestHeaders) == 0 {
+				p.Config.APISchema.RequestHeaders = p.MCPConfig.RequestHeaders
+			}
+		}
+	}
 	if p.APISchema != nil && p.Config.APISchema == nil {
 		p.Config.APISchema = p.APISchema
 	}
@@ -363,5 +392,78 @@ func (s *Server) testTool(w http.ResponseWriter, r *http.Request) {
 		"error":         res.ErrorMessage,
 		"assigned_vars": res.AssignedVars,
 		"logs":          res.Logs,
+	})
+}
+
+func (s *Server) discoverMCPTools(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ToolID         string                   `json:"tool_id"`
+		URL            string                   `json:"url"`
+		Transport      string                   `json:"transport"`
+		RequestHeaders []store.ToolHeaderSchema `json:"request_headers"`
+		SecretHeaders  map[string]string        `json:"secret_headers"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+
+	orgID := auth.FromContext(r.Context()).OrganizationID
+	var t store.Tool
+	if strings.TrimSpace(req.ToolID) != "" && isUUID(strings.TrimSpace(req.ToolID)) {
+		if existing, err := s.Store.GetTool(r.Context(), orgID, strings.TrimSpace(req.ToolID)); err == nil {
+			t = existing
+		}
+	}
+	t.Kind = "mcp"
+	if strings.TrimSpace(req.URL) != "" {
+		t.Config.URL = strings.TrimSpace(req.URL)
+		if t.Config.APISchema == nil {
+			t.Config.APISchema = &store.ToolAPISchema{}
+		}
+		t.Config.APISchema.URL = strings.TrimSpace(req.URL)
+	}
+	if strings.TrimSpace(req.Transport) != "" {
+		t.Config.Transport = strings.TrimSpace(req.Transport)
+	}
+	if len(req.RequestHeaders) > 0 {
+		if t.Config.APISchema == nil {
+			t.Config.APISchema = &store.ToolAPISchema{}
+		}
+		t.Config.APISchema.RequestHeaders = req.RequestHeaders
+	}
+	if len(req.SecretHeaders) > 0 {
+		if t.SecretHeaders == nil {
+			t.SecretHeaders = map[string]string{}
+		}
+		for k, v := range req.SecretHeaders {
+			if strings.TrimSpace(k) != "" && strings.TrimSpace(v) != "" {
+				t.SecretHeaders[k] = v
+			}
+		}
+	}
+
+	if strings.TrimSpace(t.Config.URL) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "URL do servidor MCP é obrigatória"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	sess, list, err := tools.ConnectMCPSession(ctx, s.HTTPClient, t, nil)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"connected": false,
+			"error":     err.Error(),
+			"tools":     []tools.MCPToolDef{},
+		})
+		return
+	}
+	defer sess.Close()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"connected": true,
+		"transport": sess.TransportUsed(),
+		"tools":     list,
 	})
 }

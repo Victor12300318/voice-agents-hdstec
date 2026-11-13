@@ -56,9 +56,10 @@ type SessionConfig struct {
 
 // ToolSpec é a declaração provider-agnóstica de uma função chamável pelo modelo.
 type ToolSpec struct {
-	Name        string
-	Description string
-	Parameters  []Param
+	Name             string
+	Description      string
+	Parameters       []Param
+	ParametersSchema map[string]any
 }
 
 type Param struct {

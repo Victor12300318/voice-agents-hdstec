@@ -146,20 +146,26 @@ func (p *Provider) Connect(ctx context.Context, cfg voice.SessionConfig) (voice.
 func declarations(model string, tools []voice.ToolSpec) []*genai.FunctionDeclaration {
 	out := make([]*genai.FunctionDeclaration, 0, len(tools))
 	for _, t := range tools {
-		props := map[string]any{}
-		required := []string{}
-		for _, p := range t.Parameters {
-			props[p.Name] = map[string]any{"type": p.Type, "description": p.Description}
-			if p.Required {
-				required = append(required, p.Name)
+		var schema map[string]any
+		if len(t.ParametersSchema) > 0 {
+			schema = voice.SanitizeToolJSONSchema(t.ParametersSchema)
+		} else {
+			props := map[string]any{}
+			required := []string{}
+			for _, p := range t.Parameters {
+				props[p.Name] = map[string]any{"type": p.Type, "description": p.Description}
+				if p.Required {
+					required = append(required, p.Name)
+				}
+			}
+			schema = map[string]any{
+				"type": "object", "properties": props, "required": required,
 			}
 		}
 		d := &genai.FunctionDeclaration{
-			Name:        t.Name,
-			Description: t.Description,
-			ParametersJsonSchema: map[string]any{
-				"type": "object", "properties": props, "required": required,
-			},
+			Name:                 t.Name,
+			Description:          t.Description,
+			ParametersJsonSchema: schema,
 		}
 		// Gemini 3.8 Live usa chamadas assíncronas por padrão; pedimos o modo bloqueante
 		// para que o Agent espere o resultado da Tool antes de responder.

@@ -314,21 +314,27 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 func openAITools(tools []voice.ToolSpec) []map[string]any {
 	out := make([]map[string]any, 0, len(tools))
 	for _, t := range tools {
-		props := map[string]any{}
-		required := []string{}
-		for _, p := range t.Parameters {
-			props[p.Name] = map[string]any{"type": p.Type, "description": p.Description}
-			if p.Required {
-				required = append(required, p.Name)
+		var schema map[string]any
+		if len(t.ParametersSchema) > 0 {
+			schema = voice.SanitizeToolJSONSchema(t.ParametersSchema)
+		} else {
+			props := map[string]any{}
+			required := []string{}
+			for _, p := range t.Parameters {
+				props[p.Name] = map[string]any{"type": p.Type, "description": p.Description}
+				if p.Required {
+					required = append(required, p.Name)
+				}
+			}
+			schema = map[string]any{
+				"type": "object", "properties": props, "required": required,
 			}
 		}
 		out = append(out, map[string]any{
 			"type":        "function",
 			"name":        t.Name,
 			"description": t.Description,
-			"parameters": map[string]any{
-				"type": "object", "properties": props, "required": required,
-			},
+			"parameters":  schema,
 		})
 	}
 	return out

@@ -68,6 +68,7 @@ func (s *Server) Handler() http.Handler {
 	// Ferramentas (Tools) da Organization
 	mux.Handle("GET /api/tools", protected(s.listTools))
 	mux.Handle("POST /api/tools", protected(s.createTool))
+	mux.Handle("POST /api/tools/mcp/discover", protected(s.discoverMCPTools))
 	mux.Handle("GET /api/tools/{id}", protected(s.getTool))
 	mux.Handle("PUT /api/tools/{id}", protected(s.updateTool))
 	mux.Handle("DELETE /api/tools/{id}", protected(s.deleteTool))

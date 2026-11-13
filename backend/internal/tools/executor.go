@@ -34,10 +34,7 @@ type Executor struct {
 }
 
 func NewExecutor(client *http.Client) *Executor {
-	if client == nil {
-		client = http.DefaultClient
-	}
-	return &Executor{HTTPClient: client}
+	return &Executor{HTTPClient: streamSafeHTTPClient(client)}
 }
 
 // Execute executa uma Tool mantendo compatibilidade com chamadas sem variáveis dinâmicas.
@@ -64,32 +61,9 @@ func (e *Executor) ExecuteWithVars(ctx context.Context, tool store.Tool, args ma
 	}
 
 	// 1. Verifica Mocks de Resposta ativos (avaliados de cima para baixo)
-	for _, mock := range tool.Config.ResponseMocks {
-		if !mock.Enabled {
-			continue
-		}
-		matched := false
-		if mock.ConditionType == "" || mock.ConditionType == "always" {
-			matched = true
-		} else if mock.ConditionType == "parameter_equals" && mock.ParameterName != "" {
-			if val, exists := args[mock.ParameterName]; exists && fmt.Sprint(val) == mock.ParameterValue {
-				matched = true
-			}
-		}
-		if matched {
-			var parsed any
-			if err := json.Unmarshal([]byte(mock.Response), &parsed); err != nil {
-				parsed = mock.Response
-			}
-			assigned := evaluateAssignments(tool.Config.Assignments, parsed)
-			return ExecutionResult{
-				Status:       "success",
-				Result:       map[string]any{"success": true, "data": parsed, "mocked": true},
-				RawResponse:  parsed,
-				DurationMS:   int(time.Since(start).Milliseconds()),
-				AssignedVars: assigned,
-			}
-		}
+	if mockRes, matched := CheckResponseMocks(tool, args); matched {
+		mockRes.DurationMS = int(time.Since(start).Milliseconds())
+		return mockRes
 	}
 
 	// 2. Mescla placeholders de variáveis dinâmicas + variáveis reais da conversa
@@ -479,176 +453,112 @@ try {
 	}
 }
 
-// executeMCP estabelece a sessão MCP via handshake JSON-RPC 2.0 e executa a chamada tools/call.
+// executeMCP estabelece a sessão MCP via handshake JSON-RPC 2.0 (Streamable HTTP ou SSE)
+// e executa a chamada tools/call (ou descobre ferramentas se executado como teste sem args).
 func (e *Executor) executeMCP(ctx context.Context, tool store.Tool, args map[string]any, vars map[string]string, start time.Time) ExecutionResult {
 	normalizedArgs := make(map[string]any)
+	explicitRemoteTool := ""
 	for k, v := range args {
+		if k == "_mcp_tool" {
+			explicitRemoteTool = strings.TrimSpace(fmt.Sprint(v))
+			continue
+		}
 		normalizedArgs[k] = v
 	}
-	if _, ok := normalizedArgs["parameters0_Value"]; !ok {
-		if cpfVal, exists := normalizedArgs["cpf"]; exists {
-			normalizedArgs["parameters0_Value"] = cpfVal
-		}
-		if telVal, exists := normalizedArgs["telefone"]; exists {
-			normalizedArgs["parameters1_Value"] = telVal
-		}
-		if nomeVal, exists := normalizedArgs["nome"]; exists {
-			normalizedArgs["parameters2_Value"] = nomeVal
-		}
-	}
 
-	targetURL := interpolateVars(tool.Config.URL, vars)
-	if tool.Config.APISchema != nil && tool.Config.APISchema.URL != "" {
-		targetURL = interpolateVars(tool.Config.APISchema.URL, vars)
-	}
-
-	applyHeaders := func(req *http.Request) {
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json, text/event-stream")
-		if tool.Config.APISchema != nil {
-			for _, h := range tool.Config.APISchema.RequestHeaders {
-				if strings.TrimSpace(h.Name) != "" {
-					req.Header.Set(strings.TrimSpace(h.Name), interpolateVars(h.Value, vars))
-				}
-			}
-		}
-		for k, v := range tool.SecretHeaders {
-			req.Header.Set(k, interpolateVars(v, vars))
-		}
-	}
-
-	// 1. Handshake initialize
-	initPayload := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "initialize",
-		"params": map[string]any{
-			"protocolVersion": "2024-11-05",
-			"capabilities":    map[string]any{},
-			"clientInfo": map[string]any{
-				"name":    "voiceagent",
-				"version": "1.0.0",
-			},
-		},
-	}
-	initBytes, _ := json.Marshal(initPayload)
-	initReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(initBytes))
+	sess, remoteTools, err := ConnectMCPSession(ctx, e.HTTPClient, tool, vars)
 	if err != nil {
 		ms := int(time.Since(start).Milliseconds())
-		return ExecutionResult{Status: "error", Result: map[string]any{"success": false, "error": err.Error()}, DurationMS: ms}
-	}
-	applyHeaders(initReq)
-
-	initResp, err := e.HTTPClient.Do(initReq)
-	if err != nil {
-		ms := int(time.Since(start).Milliseconds())
-		return ExecutionResult{Status: "error", Result: map[string]any{"success": false, "error": fmt.Sprintf("MCP handshake falhou: %v", err)}, DurationMS: ms}
-	}
-	defer initResp.Body.Close()
-
-	sessionID := initResp.Header.Get("Mcp-Session-Id")
-
-	// 2. Chamada tools/call
-	callPayload := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  "tools/call",
-		"params": map[string]any{
-			"name":      tool.Name,
-			"arguments": normalizedArgs,
-		},
-	}
-	callBytes, _ := json.Marshal(callPayload)
-	callReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(callBytes))
-	if err != nil {
-		ms := int(time.Since(start).Milliseconds())
-		return ExecutionResult{Status: "error", Result: map[string]any{"success": false, "error": err.Error()}, DurationMS: ms}
-	}
-	applyHeaders(callReq)
-	if sessionID != "" {
-		callReq.Header.Set("Mcp-Session-Id", sessionID)
-	}
-
-	callResp, err := e.HTTPClient.Do(callReq)
-	if err != nil {
-		ms := int(time.Since(start).Milliseconds())
-		return ExecutionResult{Status: "error", Result: map[string]any{"success": false, "error": fmt.Sprintf("MCP tools/call falhou: %v", err)}, DurationMS: ms}
-	}
-	defer callResp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(io.LimitReader(callResp.Body, 1<<20))
-	ms := int(time.Since(start).Milliseconds())
-	if err != nil {
-		return ExecutionResult{Status: "error", Result: map[string]any{"success": false, "error": err.Error()}, DurationMS: ms}
-	}
-
-	rawStr := string(bodyBytes)
-
-	var jsonText []byte
-	lines := strings.Split(rawStr, "\n")
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "data:") {
-			jsonText = []byte(strings.TrimSpace(strings.TrimPrefix(trimmed, "data:")))
-			break
-		}
-	}
-	if len(jsonText) == 0 {
-		jsonText = bodyBytes
-	}
-
-	var rpcResp struct {
-		Result struct {
-			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"result"`
-		Error *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-
-	if err := json.Unmarshal(jsonText, &rpcResp); err != nil {
 		return ExecutionResult{
 			Status:       "error",
-			Result:       map[string]any{"success": false, "error": fmt.Sprintf("MCP resposta inválida: %s", rawStr)},
+			Result:       map[string]any{"success": false, "error": err.Error()},
 			DurationMS:   ms,
 			ErrorMessage: err.Error(),
-			RawResponse:  rawStr,
+		}
+	}
+	defer sess.Close()
+
+	targetRemoteTool := explicitRemoteTool
+	if targetRemoteTool == "" {
+		for _, rt := range remoteTools {
+			if strings.EqualFold(rt.Name, tool.Name) {
+				targetRemoteTool = rt.Name
+				break
+			}
 		}
 	}
 
-	if rpcResp.Error != nil {
-		return ExecutionResult{
-			Status:       "error",
-			Result:       map[string]any{"success": false, "error": rpcResp.Error.Message},
-			DurationMS:   ms,
-			ErrorMessage: rpcResp.Error.Message,
-			RawResponse:  rawStr,
-		}
-	}
-
-	var dataOutput any
-	if len(rpcResp.Result.Content) > 0 {
-		text := rpcResp.Result.Content[0].Text
-		var inner any
-		if err := json.Unmarshal([]byte(text), &inner); err == nil {
-			dataOutput = inner
+	if targetRemoteTool == "" {
+		// Se o servidor MCP expõe exatamente 1 ferramenta e há argumentos ou schema manual, chama essa única ferramenta
+		if len(remoteTools) == 1 && (len(normalizedArgs) > 0 || len(tool.InputSchema) > 0) {
+			targetRemoteTool = remoteTools[0].Name
 		} else {
-			dataOutput = text
+			ms := int(time.Since(start).Milliseconds())
+			if len(normalizedArgs) == 0 {
+				// Modo teste/descoberta: devolve as ferramentas reais descobertas no servidor MCP
+				return ExecutionResult{
+					Status: "success",
+					Result: map[string]any{
+						"success":          true,
+						"mcp_connected":    true,
+						"transport":        sess.TransportUsed(),
+						"discovered_tools": remoteTools,
+					},
+					RawResponse: remoteTools,
+					DurationMS:  ms,
+				}
+			}
+			names := make([]string, 0, len(remoteTools))
+			for _, rt := range remoteTools {
+				names = append(names, rt.Name)
+			}
+			errMsg := fmt.Sprintf("ferramenta %q não encontrada no servidor MCP (disponíveis: %s)", tool.Name, strings.Join(names, ", "))
+			return ExecutionResult{
+				Status:       "error",
+				Result:       map[string]any{"success": false, "error": errMsg, "available_tools": names},
+				DurationMS:   ms,
+				ErrorMessage: errMsg,
+			}
 		}
-	} else {
-		dataOutput = rpcResp.Result
 	}
 
-	return ExecutionResult{
-		Status:      "success",
-		Result:      map[string]any{"success": true, "data": dataOutput},
-		RawResponse: dataOutput,
-		DurationMS:  ms,
+	return sess.CallTool(ctx, targetRemoteTool, normalizedArgs)
+}
+
+// CheckResponseMocks avalia os mocks configurados na ferramenta antes da execução real.
+func CheckResponseMocks(tool store.Tool, args map[string]any) (ExecutionResult, bool) {
+	for _, mock := range tool.Config.ResponseMocks {
+		if !mock.Enabled {
+			continue
+		}
+		matched := false
+		if mock.ConditionType == "" || mock.ConditionType == "always" {
+			matched = true
+		} else if mock.ConditionType == "parameter_equals" && mock.ParameterName != "" {
+			if val, exists := args[mock.ParameterName]; exists && fmt.Sprint(val) == mock.ParameterValue {
+				matched = true
+			}
+		}
+		if matched {
+			var parsed any
+			if err := json.Unmarshal([]byte(mock.Response), &parsed); err != nil {
+				parsed = mock.Response
+			}
+			assigned := evaluateAssignments(tool.Config.Assignments, parsed)
+			return ExecutionResult{
+				Status:       "success",
+				Result:       map[string]any{"success": true, "data": parsed, "mocked": true},
+				RawResponse:  parsed,
+				AssignedVars: assigned,
+			}, true
+		}
 	}
+	return ExecutionResult{}, false
+}
+
+// EvaluateAssignments extrai valores de resposta para variáveis dinâmicas conforme assignments da tool.
+func EvaluateAssignments(tool store.Tool, raw any) map[string]string {
+	return evaluateAssignments(tool.Config.Assignments, raw)
 }
 
 // evaluateAssignments extrai valores do JSON de resposta (por caminho com ponto, ex: "data.plano") para atualizar variáveis dinâmicas.

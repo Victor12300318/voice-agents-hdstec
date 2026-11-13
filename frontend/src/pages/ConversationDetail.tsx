@@ -216,6 +216,28 @@ export default function ConversationDetailPage() {
         continue
       }
 
+      if (ev.type === 'mcp_connected') {
+        items.push({
+          kind: 'badge',
+          id: String(ev.id),
+          badgeType: 'tool',
+          timeStr,
+          label: `MCP conectado (${p.tool_name || 'MCP'} • ${p.transport || ''}): ${p.tool_count ?? 0} ferramenta(s)`,
+        })
+        continue
+      }
+
+      if (ev.type === 'mcp_connection_error') {
+        items.push({
+          kind: 'badge',
+          id: String(ev.id),
+          badgeType: 'guardian',
+          timeStr,
+          label: `Falha ao conectar MCP (${p.tool_name || 'MCP'}): ${p.error || 'erro desconhecido'}`,
+        })
+        continue
+      }
+
       if (ev.type === 'interruption') {
         forceNewBubble = true
         items.push({

@@ -297,7 +297,16 @@ func (rt *Runtime) RunSessionWithOptions(
 
 	var toolSpecs []voice.ToolSpec
 	registeredTools := make(map[string]store.Tool)
-	addedToolIDs := make(map[string]bool)
+	mcpSessions := make(map[string]*tools.MCPSession)
+	mcpBindings := make(map[string]mcpToolBinding)
+
+	defer func() {
+		for _, ms := range mcpSessions {
+			if ms != nil {
+				ms.Close()
+			}
+		}
+	}()
 
 	for _, st := range cfg.SystemTools {
 		if st == "encerrar_conversa" {
@@ -413,38 +422,14 @@ func (rt *Runtime) RunSessionWithOptions(
 		})
 	}
 
-	registerToolByID := func(toolID string) {
-		if toolID == "" || addedToolIDs[toolID] {
-			return
-		}
-		t, err := rt.Store.GetTool(ctx, orgID, toolID)
-		if err == nil && t.Active {
-			addedToolIDs[toolID] = true
-			toolSpecs = append(toolSpecs, voice.ToolSpec{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  t.InputSchema,
-			})
-			registeredTools[t.Name] = t
-		}
-	}
-
-	for _, toolID := range cfg.Tools {
-		registerToolByID(toolID)
-	}
-
-	// Auto-attach: Tools referenciadas inline ou em Structured Procedures são registradas automaticamente (estilo ElevenLabs)
-	for _, p := range activeProcedures {
-		meta := procedures.InspectProcedure(store.Procedure{
-			ID:      p.ID,
-			Name:    p.Name,
-			Type:    p.Type,
-			Trigger: p.Trigger,
-			Content: p.Content,
-		}, procsMap, nil, nil)
-		for _, refToolID := range meta.ReferencedToolIDs {
-			registerToolByID(refToolID)
-		}
+	mcpSummaryLines := rt.bindAgentToolsAndMCP(
+		ctx, orgID, conv.ID, cfg.Tools, cfg.SystemPrompt, activeProcedures, procsMap, allVars,
+		&toolSpecs, registeredTools, mcpSessions, mcpBindings,
+	)
+	if len(mcpSummaryLines) > 0 {
+		systemPrompt += "\n\n## FERRAMENTAS DE INTEGRAÇÃO MCP CONECTADAS:\n" +
+			"Quando um procedimento mencionar uma integração MCP pelo nome do servidor, chame diretamente a ferramenta específica listada abaixo correspondente à solicitação do usuário:\n" +
+			strings.Join(mcpSummaryLines, "\n")
 	}
 
 	// 5. Conecta com o Voice Provider
@@ -551,6 +536,9 @@ func (rt *Runtime) RunSessionWithOptions(
 		for name := range registeredTools {
 			activeAllowedTools[name] = true
 		}
+		for name := range mcpBindings {
+			activeAllowedTools[name] = true
+		}
 	} else {
 		// Ferramentas anexadas globalmente ao agente ou referenciadas em procedures ativos ficam permitidas
 		for _, globalToolID := range cfg.Tools {
@@ -564,6 +552,9 @@ func (rt *Runtime) RunSessionWithOptions(
 			}
 		}
 		for name := range registeredTools {
+			activeAllowedTools[name] = true
+		}
+		for name := range mcpBindings {
 			activeAllowedTools[name] = true
 		}
 	}
@@ -1383,7 +1374,8 @@ func (rt *Runtime) RunSessionWithOptions(
 
 						var childToolSpecs []voice.ToolSpec
 						newRegisteredTools := make(map[string]store.Tool)
-						newAddedToolIDs := make(map[string]bool)
+						newMCPSessions := make(map[string]*tools.MCPSession)
+						newMCPBindings := make(map[string]mcpToolBinding)
 
 						for _, st := range targetCfg.SystemTools {
 							if st == "encerrar_conversa" {
@@ -1443,29 +1435,12 @@ func (rt *Runtime) RunSessionWithOptions(
 							childPrompt += trigSb.String()
 						}
 
-						registerChildTool := func(tid string) {
-							if tid != "" && !newAddedToolIDs[tid] {
-								if t, err := rt.Store.GetTool(sessionCtx, orgID, tid); err == nil && t.Active {
-									newAddedToolIDs[tid] = true
-									childToolSpecs = append(childToolSpecs, voice.ToolSpec{Name: t.Name, Description: t.Description, Parameters: t.InputSchema})
-									newRegisteredTools[t.Name] = t
-								}
-							}
-						}
-						for _, tid := range targetCfg.Tools {
-							registerChildTool(tid)
-						}
-						for _, p := range newActiveProcedures {
-							meta := procedures.InspectProcedure(store.Procedure{
-								ID:      p.ID,
-								Name:    p.Name,
-								Type:    p.Type,
-								Trigger: p.Trigger,
-								Content: p.Content,
-							}, newProcsMap, nil, nil)
-							for _, refToolID := range meta.ReferencedToolIDs {
-								registerChildTool(refToolID)
-							}
+						childMCPLines := rt.bindAgentToolsAndMCP(
+							sessionCtx, orgID, conv.ID, targetCfg.Tools, targetCfg.SystemPrompt, newActiveProcedures, newProcsMap, allVars,
+							&childToolSpecs, newRegisteredTools, newMCPSessions, newMCPBindings,
+						)
+						if len(childMCPLines) > 0 {
+							childPrompt += "\n\n## FERRAMENTAS DE INTEGRAÇÃO MCP CONECTADAS:\n" + strings.Join(childMCPLines, "\n")
 						}
 
 						childSess, err := childProv.Connect(sessionCtx, voice.SessionConfig{
@@ -1476,6 +1451,11 @@ func (rt *Runtime) RunSessionWithOptions(
 							Tools:        childToolSpecs,
 						})
 						if err != nil {
+							for _, ms := range newMCPSessions {
+								if ms != nil {
+									ms.Close()
+								}
+							}
 							errRes := map[string]any{"success": false, "error": fmt.Sprintf("falha ao conectar ao agente %s: %v", targetAgent.Name, err)}
 							_ = getProvSess().SendToolResult(fc, errRes)
 							continue
@@ -1495,17 +1475,28 @@ func (rt *Runtime) RunSessionWithOptions(
 						provSessMu.Unlock()
 						_ = oldSess.Close()
 
+						for _, oldMS := range mcpSessions {
+							if oldMS != nil {
+								oldMS.Close()
+							}
+						}
+
 						agentID = targetAgent.ID
 						cfg = targetCfg
 						procsMap = newProcsMap
 						activeProcedures = newActiveProcedures
 						entryProcedures = newEntryProcedures
 						registeredTools = newRegisteredTools
+						mcpSessions = newMCPSessions
+						mcpBindings = newMCPBindings
 						procMu.Lock()
 						recentActivatedProcs = nil
 						activatedProcIDs = make(map[string]bool)
 						activeAllowedTools = make(map[string]bool)
 						for tName := range newRegisteredTools {
+							activeAllowedTools[tName] = true
+						}
+						for tName := range newMCPBindings {
 							activeAllowedTools[tName] = true
 						}
 						procMu.Unlock()
@@ -1534,6 +1525,106 @@ func (rt *Runtime) RunSessionWithOptions(
 							_ = childSess.SendText(fmt.Sprintf("A conversa foi encaminhada para você (motivo: %q). Continue o atendimento imediatamente a partir do histórico da conversa, sem mencionar a transferência interna.", reason))
 						}
 						continue
+					} else if binding, isMCP := mcpBindings[fc.Name]; isMCP {
+						targetTool := binding.ParentTool
+						for _, p := range activeProcedures {
+							meta := procedures.InspectProcedure(store.Procedure{
+								ID:      p.ID,
+								Name:    p.Name,
+								Type:    p.Type,
+								Trigger: p.Trigger,
+								Content: p.Content,
+							}, procsMap, nil, nil)
+							for _, refToolID := range meta.ReferencedToolIDs {
+								if refToolID == targetTool.ID || strings.EqualFold(refToolID, targetTool.Name) {
+									procMu.Lock()
+									already := activatedProcIDs[p.ID]
+									procMu.Unlock()
+									if !already {
+										_, _, _ = activateProcedure(p)
+									}
+								}
+							}
+						}
+
+						hasSpecificTools := false
+						for tName := range activeAllowedTools {
+							if tName != "encerrar_conversa" && tName != "end_call" {
+								hasSpecificTools = true
+								break
+							}
+						}
+						if hasSpecificTools && !activeAllowedTools[fc.Name] && !activeAllowedTools[targetTool.Name] {
+							rejected := map[string]any{
+								"success": false,
+								"error":   fmt.Sprintf("A ferramenta MCP '%s' (%s) não é permitida no procedimento ativo ('%s').", fc.Name, targetTool.Name, activeProcedureName),
+							}
+							_ = getProvSess().SendToolResult(fc, rejected)
+							_ = rt.Store.RecordToolExecution(sessionCtx, store.ToolExecution{
+								OrganizationID:  orgID,
+								AgentID:         agentID,
+								ConversationID:  conv.ID,
+								ToolID:          &targetTool.ID,
+								ToolName:        binding.RemoteToolName,
+								ProcedureID:     activeProcedureID,
+								Request:         mustJSON(fc.Args),
+								Response:        mustJSON(rejected),
+								Status:          "rejected",
+								ExecutionTimeMS: 0,
+							})
+							continue
+						}
+
+						callArgs := make(map[string]any, len(fc.Args))
+						for k, v := range fc.Args {
+							callArgs[k] = v
+						}
+
+						var execRes tools.ExecutionResult
+						if mockRes, matched := tools.CheckResponseMocks(targetTool, callArgs); matched {
+							execRes = mockRes
+						} else {
+							callTimeout := time.Duration(targetTool.TimeoutMS) * time.Millisecond
+							if callTimeout <= 0 {
+								callTimeout = 20 * time.Second
+							}
+							callCtx, cancelCall := context.WithTimeout(sessionCtx, callTimeout)
+							execRes = binding.Session.CallTool(callCtx, binding.RemoteToolName, callArgs)
+							cancelCall()
+							if execRes.Status == "success" {
+								if assigned := tools.EvaluateAssignments(targetTool, execRes.RawResponse); len(assigned) > 0 {
+									execRes.AssignedVars = assigned
+								}
+							}
+						}
+						for varKey, varVal := range execRes.AssignedVars {
+							allVars[varKey] = varVal
+						}
+						_ = getProvSess().SendToolResult(fc, execRes.Result)
+						_ = rt.Store.RecordToolExecution(sessionCtx, store.ToolExecution{
+							OrganizationID:  orgID,
+							AgentID:         agentID,
+							ConversationID:  conv.ID,
+							ToolID:          &targetTool.ID,
+							ToolName:        binding.RemoteToolName,
+							ProcedureID:     activeProcedureID,
+							Request:         mustJSON(fc.Args),
+							Response:        mustJSON(execRes.Result),
+							Status:          execRes.Status,
+							ExecutionTimeMS: execRes.DurationMS,
+						})
+						_ = sendJSON(serverMessage{Type: "tool_result", Text: fc.Name})
+						evPayload := map[string]any{
+							"name":        fc.Name,
+							"remote_tool": binding.RemoteToolName,
+							"mcp_server":  targetTool.Name,
+							"status":      execRes.Status,
+							"duration_ms": execRes.DurationMS,
+						}
+						if execRes.ErrorMessage != "" {
+							evPayload["error"] = execRes.ErrorMessage
+						}
+						_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "tool_result", evPayload)
 					} else if targetTool, ok := registeredTools[fc.Name]; ok {
 						// Se a ferramenta chamada pertence a um procedure que ainda não foi marcado como ativado, ativa-o automaticamente
 						for _, p := range activeProcedures {
@@ -1630,9 +1721,13 @@ func (rt *Runtime) RunSessionWithOptions(
 							ExecutionTimeMS: execRes.DurationMS,
 						})
 						_ = sendJSON(serverMessage{Type: "tool_result", Text: targetTool.Name})
-						_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "tool_result", map[string]any{
+						evPayload := map[string]any{
 							"name": targetTool.Name, "status": execRes.Status, "duration_ms": execRes.DurationMS,
-						})
+						}
+						if execRes.ErrorMessage != "" {
+							evPayload["error"] = execRes.ErrorMessage
+						}
+						_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "tool_result", evPayload)
 					} else {
 						// Ferramenta não permitida
 						rejected := map[string]any{"success": false, "error": "ferramenta não autorizada neste momento"}
@@ -1941,4 +2036,230 @@ func matchProceduresByCallerTranscript(callerText string, procs []store.Procedur
 		}
 	}
 	return matched
+}
+
+type mcpToolBinding struct {
+	ParentTool     store.Tool
+	RemoteToolName string
+	Session        *tools.MCPSession
+}
+
+func (rt *Runtime) bindAgentToolsAndMCP(
+	ctx context.Context,
+	orgID, convID string,
+	cfgToolIDs []string,
+	rawPrompt string,
+	activeProcedures []store.ProcedureSnapshot,
+	procsMap map[string]store.ProcedureSnapshot,
+	allVars map[string]string,
+	toolSpecs *[]voice.ToolSpec,
+	registeredTools map[string]store.Tool,
+	mcpSessions map[string]*tools.MCPSession,
+	mcpBindings map[string]mcpToolBinding,
+) []string {
+	addedToolIDs := make(map[string]bool)
+	usedToolNames := make(map[string]bool)
+	for _, ts := range *toolSpecs {
+		usedToolNames[ts.Name] = true
+	}
+
+	var mcpSummaryLines []string
+	var orderedTools []store.Tool
+
+	collectTool := func(ref string) {
+		ref = strings.TrimSpace(ref)
+		if ref == "" || addedToolIDs[ref] {
+			return
+		}
+		var t store.Tool
+		var err error
+		if len(ref) == 36 && strings.Count(ref, "-") == 4 {
+			t, err = rt.Store.GetTool(ctx, orgID, ref)
+		} else {
+			t, err = rt.Store.GetToolByName(ctx, orgID, ref)
+		}
+		if err != nil || !t.Active || addedToolIDs[t.ID] {
+			return
+		}
+		addedToolIDs[ref] = true
+		addedToolIDs[t.ID] = true
+		orderedTools = append(orderedTools, t)
+	}
+
+	for _, toolID := range cfgToolIDs {
+		collectTool(toolID)
+	}
+	for _, ref := range procedures.ParseReferences(rawPrompt) {
+		if ref.Kind == "tool" {
+			collectTool(ref.ID)
+		}
+	}
+	for _, p := range activeProcedures {
+		meta := procedures.InspectProcedure(store.Procedure{
+			ID:      p.ID,
+			Name:    p.Name,
+			Type:    p.Type,
+			Trigger: p.Trigger,
+			Content: p.Content,
+		}, procsMap, nil, nil)
+		for _, refToolID := range meta.ReferencedToolIDs {
+			collectTool(refToolID)
+		}
+	}
+
+	// Descobre ferramentas dos servidores MCP em paralelo para não somar latência no início da ligação
+	type mcpResult struct {
+		tool        store.Tool
+		sess        *tools.MCPSession
+		remoteTools []tools.MCPToolDef
+		err         error
+	}
+	mcpResults := make(map[string]mcpResult)
+	var mcpMu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, t := range orderedTools {
+		isMCP := t.Kind == "mcp" || (t.Kind == "webhook" && strings.Contains(strings.ToLower(t.Config.URL), "/mcp") && len(t.InputSchema) == 0)
+		if !isMCP {
+			continue
+		}
+		wg.Add(1)
+		go func(toolItem store.Tool) {
+			defer wg.Done()
+			discCtx, discCancel := context.WithTimeout(ctx, 15*time.Second)
+			defer discCancel()
+			sess, remoteTools, discErr := tools.ConnectMCPSession(discCtx, rt.HTTPClient, toolItem, allVars)
+			mcpMu.Lock()
+			mcpResults[toolItem.ID] = mcpResult{
+				tool:        toolItem,
+				sess:        sess,
+				remoteTools: remoteTools,
+				err:         discErr,
+			}
+			mcpMu.Unlock()
+		}(t)
+	}
+	wg.Wait()
+
+	for _, t := range orderedTools {
+		if res, wasMCP := mcpResults[t.ID]; wasMCP {
+			if res.err == nil && len(res.remoteTools) > 0 {
+				mcpSessions[t.ID] = res.sess
+				var exposedNames []string
+				for _, rtTool := range res.remoteTools {
+					fnName := sanitizeLLMToolName(rtTool.Name, usedToolNames, t.Name)
+					usedToolNames[fnName] = true
+					desc := strings.TrimSpace(rtTool.Description)
+					if desc == "" {
+						desc = t.Description
+					}
+					var paramSchema map[string]any
+					if len(rtTool.InputSchema) > 0 {
+						paramSchema = voice.SanitizeToolJSONSchema(rtTool.InputSchema)
+					} else {
+						paramSchema = map[string]any{
+							"type":       "object",
+							"properties": map[string]any{},
+							"required":   []string{},
+						}
+					}
+					*toolSpecs = append(*toolSpecs, voice.ToolSpec{
+						Name:             fnName,
+						Description:      desc,
+						Parameters:       voice.ExtractFlatParams(paramSchema),
+						ParametersSchema: paramSchema,
+					})
+					mcpBindings[fnName] = mcpToolBinding{
+						ParentTool:     t,
+						RemoteToolName: rtTool.Name,
+						Session:        res.sess,
+					}
+					exposedNames = append(exposedNames, fnName)
+				}
+				mcpSummaryLines = append(mcpSummaryLines, fmt.Sprintf("- Servidor MCP %q (transporte %s): ferramentas disponíveis -> %s", t.Name, res.sess.TransportUsed(), strings.Join(exposedNames, ", ")))
+				_ = rt.Store.RecordEvent(ctx, orgID, convID, "mcp_connected", map[string]any{
+					"tool_id":    t.ID,
+					"tool_name":  t.Name,
+					"transport":  res.sess.TransportUsed(),
+					"tools":      exposedNames,
+					"tool_count": len(exposedNames),
+				})
+				continue
+			}
+			if res.sess != nil {
+				res.sess.Close()
+			}
+			errText := "nenhuma ferramenta retornada por tools/list"
+			if res.err != nil {
+				errText = res.err.Error()
+			}
+			rt.Log.Warn("mcp_discover_failed", "conversation_id", convID, "tool", t.Name, "url", t.Config.URL, "error", errText)
+			_ = rt.Store.RecordEvent(ctx, orgID, convID, "mcp_connection_error", map[string]any{
+				"tool_id":   t.ID,
+				"tool_name": t.Name,
+				"url":       t.Config.URL,
+				"error":     errText,
+			})
+		}
+
+		fnName := sanitizeLLMToolName(t.Name, usedToolNames, "tool")
+		usedToolNames[fnName] = true
+		*toolSpecs = append(*toolSpecs, voice.ToolSpec{
+			Name:        fnName,
+			Description: t.Description,
+			Parameters:  t.InputSchema,
+		})
+		registeredTools[fnName] = t
+	}
+
+	return mcpSummaryLines
+}
+
+func sanitizeLLMToolName(raw string, used map[string]bool, fallbackPrefix string) string {
+	clean := func(s string) string {
+		var sb strings.Builder
+		for _, r := range s {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+				sb.WriteRune(r)
+			} else {
+				sb.WriteByte('_')
+			}
+		}
+		res := strings.Trim(sb.String(), "_")
+		if res == "" {
+			res = "mcp_tool"
+		}
+		if res[0] >= '0' && res[0] <= '9' || res[0] == '-' {
+			res = "t_" + res
+		}
+		if len(res) > 64 {
+			res = res[:64]
+		}
+		return res
+	}
+
+	base := clean(raw)
+	if !used[base] {
+		return base
+	}
+	pref := clean(fallbackPrefix)
+	candidate := pref + "_" + base
+	if len(candidate) > 64 {
+		candidate = candidate[:64]
+	}
+	if !used[candidate] {
+		return candidate
+	}
+	for i := 2; i <= 99; i++ {
+		suf := fmt.Sprintf("_%d", i)
+		c := base
+		if len(c)+len(suf) > 64 {
+			c = c[:64-len(suf)]
+		}
+		c += suf
+		if !used[c] {
+			return c
+		}
+	}
+	return base
 }
