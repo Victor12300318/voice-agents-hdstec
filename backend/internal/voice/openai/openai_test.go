@@ -77,3 +77,20 @@ func TestOpenAIDispatchEvents(t *testing.T) {
 		t.Fatal("evento de tool call não recebido")
 	}
 }
+
+func TestOpenAIDelegationModelsCatalog(t *testing.T) {
+	p := New("")
+	cat := p.Catalog()
+	if len(cat.DelegationModels) == 0 {
+		t.Fatal("esperava DelegationModels preenchido no catálogo OpenAI")
+	}
+	foundDefault := false
+	for _, dm := range cat.DelegationModels {
+		if dm.Default {
+			foundDefault = true
+		}
+	}
+	if !foundDefault {
+		t.Fatal("esperava um modelo de delegação padrão no catálogo OpenAI")
+	}
+}

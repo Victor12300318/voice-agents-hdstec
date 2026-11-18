@@ -39,6 +39,7 @@ export type ProviderCatalog = {
   provider: string
   label: string
   models: Option[]
+  delegation_models?: Option[]
   voices: Option[]
   languages: Option[]
   max_session_seconds: number
@@ -299,6 +300,7 @@ export type GuardianJevConfig = {
 export type SystemToolsConfig = {
   transfer_to_agent?: TransferToAgentToolConfig
   guardian_jev?: GuardianJevConfig
+  delegation_model?: string
 }
 
 export type AgentVersionSummary = {

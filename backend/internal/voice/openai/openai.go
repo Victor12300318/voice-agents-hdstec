@@ -33,6 +33,17 @@ var models = []voice.Option{
 	{ID: "gpt-4o-mini-realtime-preview", Label: "GPT-4o Mini Realtime (Legado)", Description: "Redireciona automaticamente para GPT Realtime 2.1 Mini"},
 }
 
+var delegationModels = []voice.Option{
+	{ID: "gpt-4.1-mini", Label: "GPT-4.1 Mini", Description: "Padrão equilibrado — rápido e preciso para ferramentas e procedimentos", Default: true},
+	{ID: "gpt-4.1-nano", Label: "GPT-4.1 Nano", Description: "Ultra-rápido e econômico — menor latência na execução de tarefas"},
+	{ID: "gpt-4.1", Label: "GPT-4.1", Description: "Máxima precisão para regras complexas e múltiplos procedimentos"},
+	{ID: "gpt-4o-mini", Label: "GPT-4o Mini", Description: "Leve e rápido para fluxos simples"},
+	{ID: "gpt-4o", Label: "GPT-4o", Description: "Modelo completo para raciocínio geral"},
+	{ID: "gpt-5-mini", Label: "GPT-5 Mini", Description: "Nova geração equilibrada para tarefas e ferramentas"},
+	{ID: "gpt-5-nano", Label: "GPT-5 Nano", Description: "Nova geração ultra-rápida e econômica"},
+	{ID: "gpt-5", Label: "GPT-5", Description: "Nova geração com máxima capacidade de raciocínio"},
+}
+
 var voices = []voice.Option{
 	{ID: "bossa", Label: "Bossa (PT-BR)", Description: "Feminina brasileira natural (Nativa GPT-Live 1)", Default: true},
 	{ID: "tempo", Label: "Tempo (PT-BR)", Description: "Masculina brasileira natural (Nativa GPT-Live 1)"},
@@ -92,6 +103,7 @@ func (p *Provider) Catalog() voice.Catalog {
 		Provider:          ProviderID,
 		Label:             "OpenAI Realtime & GPT-Live",
 		Models:            models,
+		DelegationModels:  delegationModels,
 		Voices:            voices,
 		Languages:         languages,
 		MaxSessionSeconds: 1800,
@@ -229,7 +241,19 @@ func (p *Provider) Connect(ctx context.Context, cfg voice.SessionConfig) (voice.
 	}
 
 	go sess.readLoop()
+	if fm := strings.TrimSpace(cfg.FirstMessage); fm != "" {
+		if err := sess.SendText(firstMessagePrompt(fm)); err == nil {
+			sess.firstMessagePrimed = true
+		}
+	}
 	return sess, nil
+}
+
+func firstMessagePrompt(firstMessage string) string {
+	return fmt.Sprintf(
+		"ATENÇÃO (PRIMEIRO TURNO DA LIGAÇÃO): Fale agora IMEDIATAMENTE e em tom natural APENAS e EXATAMENTE esta frase de saudação, sem chamar ferramentas nem delegar tarefas neste turno, e aguarde o cliente responder:\n%q",
+		firstMessage,
+	)
 }
 
 // connectLive estabelece uma sessão WebSocket no protocolo GPT-Live 1 (wss://api.openai.com/v1/live/sessions).
@@ -250,17 +274,35 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 		startedCh: make(chan struct{}),
 		stopCh:    make(chan struct{}),
 	}
-	sess.lastAudioAt.Store(time.Now().UnixMilli())
+	// Começa zerado para o relógio de áudio disparar imediatamente na primeira fala antes do microfone conectar
+	sess.lastAudioAt.Store(0)
 
-	livePrompt := cfg.SystemPrompt
-	if len(livePrompt) > 28000 {
-		livePrompt = livePrompt[:28000]
-	}
+	var suffix strings.Builder
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(cfg.Language)), "pt") || cfg.Language == "" {
-		livePrompt += "\n\nATENÇÃO DE ESCUTA E TRANSCRIÇÃO (PT-BR): O cliente está falando EXCLUSIVAMENTE em Português do Brasil (pt-BR) por telefone. Interprete todas as respostas curtas em português do Brasil (ex: 'Sim', 'Não', 'Pode sim', 'Já', 'Dá conta', 'WhatsApp', dígitos de CPF). Jamais transcreva em espanhol ('¿Sí?'), inglês ('Now', 'boxing') ou alemão ('Ja')."
+		suffix.WriteString("\n\nATENÇÃO DE ESCUTA E TRANSCRIÇÃO (PT-BR): O cliente está falando EXCLUSIVAMENTE em Português do Brasil (pt-BR) por telefone. Interprete todas as respostas curtas em português do Brasil (ex: 'Sim', 'Não', 'Pode sim', 'Já', 'Dá conta', 'WhatsApp', dígitos de CPF). Jamais transcreva em espanhol ('¿Sí?'), inglês ('Now', 'boxing') ou alemão ('Ja').")
 	}
 	if len(cfg.Tools) > 0 {
-		livePrompt += "\n\nQuando precisar executar qualquer ferramenta (como encerrar_conversa, transfer_to_agent ou webhooks), delegue imediatamente ao backend."
+		suffix.WriteString("\n\nQuando precisar executar qualquer ferramenta (como encerrar_conversa, transfer_to_agent ou webhooks), delegue imediatamente ao backend.")
+	}
+	firstMsg := strings.TrimSpace(cfg.FirstMessage)
+	if firstMsg != "" {
+		suffix.WriteString(fmt.Sprintf("\n\nPRIMEIRA FALA IMEDIATA AO INICIAR: Fale imediatamente ao conectar APENAS a frase %q sem chamar ferramentas e aguarde a resposta do cliente.", firstMsg))
+	}
+
+	suffixStr := suffix.String()
+	maxPromptBody := 28000 - len(suffixStr)
+	if maxPromptBody < 1000 {
+		maxPromptBody = 1000
+	}
+	livePrompt := cfg.SystemPrompt
+	if len(livePrompt) > maxPromptBody {
+		livePrompt = livePrompt[:maxPromptBody]
+	}
+	livePrompt += suffixStr
+
+	delegationModel := strings.TrimSpace(cfg.DelegationModel)
+	if delegationModel == "" {
+		delegationModel = "gpt-4.1-mini"
 	}
 
 	voiceID := resolveLiveVoice(cfg.Voice)
@@ -282,7 +324,7 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 			"delegation": map[string]any{
 				"type": "responses",
 				"responses": map[string]any{
-					"model":        "gpt-4.1-mini",
+					"model":        delegationModel,
 					"instructions": cfg.SystemPrompt,
 					"tools":        openAITools(cfg.Tools),
 					"tool_choice":  "auto",
@@ -305,6 +347,12 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 	case <-ctx.Done():
 		_ = sess.Close()
 		return nil, ctx.Err()
+	}
+
+	if firstMsg != "" {
+		if err := sess.SendText(firstMessagePrompt(firstMsg)); err == nil {
+			sess.firstMessagePrimed = true
+		}
 	}
 
 	go sess.silenceKeepaliveLoop()
@@ -345,25 +393,28 @@ func openAITools(tools []voice.ToolSpec) []map[string]any {
 // ============================================================================
 
 type openAILiveSession struct {
-	conn           *websocket.Conn
-	events         chan voice.Event
-	startedCh      chan struct{}
-	startedOnce    sync.Once
-	stopCh         chan struct{}
-	stopOnce       sync.Once
-	writeMu        sync.Mutex
-	mu             sync.Mutex
-	closed         bool
-	eventSeq       atomic.Int64
-	lastAudioAt    atomic.Int64
-	lastOutputAt   atomic.Int64
-	agentSpeaking  atomic.Bool
-	silentTailSent atomic.Int32
-	turnTimer      *time.Timer
-	speechTimer    *time.Timer
-	prevInSample   int32
-	hasPrevSample  bool
+	conn               *websocket.Conn
+	events             chan voice.Event
+	startedCh          chan struct{}
+	startedOnce        sync.Once
+	stopCh             chan struct{}
+	stopOnce           sync.Once
+	writeMu            sync.Mutex
+	mu                 sync.Mutex
+	closed             bool
+	firstMessagePrimed bool
+	eventSeq           atomic.Int64
+	lastAudioAt        atomic.Int64
+	lastOutputAt       atomic.Int64
+	agentSpeaking      atomic.Bool
+	silentTailSent     atomic.Int32
+	turnTimer          *time.Timer
+	speechTimer        *time.Timer
+	prevInSample       int32
+	hasPrevSample      bool
 }
+
+func (s *openAILiveSession) FirstMessagePrimed() bool { return s.firstMessagePrimed }
 
 func isAudiblePCM16(pcm []byte) bool {
 	num := len(pcm) / 2
@@ -396,10 +447,11 @@ func (s *openAILiveSession) writeJSON(v any) error {
 	return s.conn.Write(writeCtx, websocket.MessageText, data)
 }
 
+var silenceFrame100msB64 = base64.StdEncoding.EncodeToString(make([]byte, 4800)) // 100ms em 24kHz PCM16
+
 // silenceKeepaliveLoop mantém o relógio de áudio do GPT-Live 1 avançando apenas quando não há
-// stream de microfone ativo há >= 600ms (ex: no preview de voz ou antes do cliente conectar).
+// stream de microfone ativo há >= 200ms (ex: no preview de voz ou antes do cliente conectar).
 func (s *openAILiveSession) silenceKeepaliveLoop() {
-	silence100ms := base64.StdEncoding.EncodeToString(make([]byte, 4800)) // 100ms em 24kHz PCM16
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -407,13 +459,22 @@ func (s *openAILiveSession) silenceKeepaliveLoop() {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
-			if time.Since(time.UnixMilli(s.lastAudioAt.Load())) >= 600*time.Millisecond {
+			if time.Since(time.UnixMilli(s.lastAudioAt.Load())) >= 200*time.Millisecond {
 				_ = s.writeJSON(map[string]string{
 					"type":  "session.input_audio.append",
-					"audio": silence100ms,
+					"audio": silenceFrame100msB64,
 				})
 			}
 		}
+	}
+}
+
+func (s *openAILiveSession) primeAudioClock() {
+	for i := 0; i < 2; i++ {
+		_ = s.writeJSON(map[string]string{
+			"type":  "session.input_audio.append",
+			"audio": silenceFrame100msB64,
+		})
 	}
 }
 
@@ -433,12 +494,19 @@ func (s *openAILiveSession) SendAudio(pcm16k []byte) error {
 }
 
 func (s *openAILiveSession) SendText(text string) error {
-	return s.writeJSON(map[string]any{
+	if err := s.writeJSON(map[string]any{
 		"type":          "session.instructions.append",
 		"event_id":      s.nextEventID("inst"),
 		"delegation_id": nil,
 		"content":       text,
-	})
+	}); err != nil {
+		return err
+	}
+	// Se ainda não há áudio do microfone/telefonia chegando, avança imediatamente o relógio de áudio do GPT-Live
+	if time.Since(time.UnixMilli(s.lastAudioAt.Load())) >= 100*time.Millisecond {
+		s.primeAudioClock()
+	}
+	return nil
 }
 
 func (s *openAILiveSession) SendToolResult(call voice.ToolCall, result map[string]any) error {
@@ -623,14 +691,17 @@ func (s *openAILiveSession) dispatch(data []byte) {
 // ============================================================================
 
 type openAISession struct {
-	conn          *websocket.Conn
-	events        chan voice.Event
-	writeMu       sync.Mutex
-	mu            sync.Mutex
-	closed        bool
-	prevInSample  int32
-	hasPrevSample bool
+	conn               *websocket.Conn
+	events             chan voice.Event
+	writeMu            sync.Mutex
+	mu                 sync.Mutex
+	closed             bool
+	firstMessagePrimed bool
+	prevInSample       int32
+	hasPrevSample      bool
 }
+
+func (s *openAISession) FirstMessagePrimed() bool { return s.firstMessagePrimed }
 
 // upsample16to24Bytes converte PCM16 LE de 16000 Hz para 24000 Hz (razão 2 -> 3).
 func upsample16to24Bytes(pcm16k []byte) []byte {

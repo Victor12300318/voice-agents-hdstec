@@ -40,6 +40,7 @@ type GuardianJevConfig struct {
 type SystemToolsConfig struct {
 	TransferToAgent *TransferToAgentToolConfig `json:"transfer_to_agent,omitempty"`
 	GuardianJev     *GuardianJevConfig         `json:"guardian_jev,omitempty"`
+	DelegationModel string                     `json:"delegation_model,omitempty"`
 }
 
 // AgentConfig é o que uma Agent Version congela (ADR 0002): tudo que é do Agent,

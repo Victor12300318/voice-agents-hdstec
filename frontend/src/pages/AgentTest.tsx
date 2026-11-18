@@ -142,7 +142,8 @@ export default function AgentTest() {
       }
       playerRef.current = player
 
-      // 2. Conecta o WebSocket via proxy do nginx (mesma origem)
+      // 2. Conecta o WebSocket e pré-aquece o microfone em paralelo
+      let wsReady = false
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
       const wsUrl = `${protocol}//${window.location.host}/ws/conversations/${detail.id}?version=${encodeURIComponent(
         selectedVersion,
@@ -151,6 +152,24 @@ export default function AgentTest() {
       const ws = new WebSocket(wsUrl)
       ws.binaryType = 'arraybuffer'
       wsRef.current = ws
+
+      const prewarmedRecorder = new AudioRecorder((pcm) => {
+        if (wsReady && ws.readyState === WebSocket.OPEN) {
+          ws.send(pcm)
+        }
+      })
+      const micInitPromise = prewarmedRecorder
+        .start(16000)
+        .then(() => {
+          if (wsRef.current !== ws) {
+            prewarmedRecorder.stop()
+            return null
+          }
+          recorderRef.current = prewarmedRecorder
+          setMicStream(prewarmedRecorder.getStream())
+          return null
+        })
+        .catch((err) => err as Error)
 
       ws.onopen = async () => {
         setStatusDetail('Conexão aberta. Aguardando Voice Provider...')
@@ -162,22 +181,29 @@ export default function AgentTest() {
             const msg = JSON.parse(event.data)
             switch (msg.type) {
               case 'ready':
+                wsReady = true
                 setStatus('listening')
                 setStatusDetail('Pronto! Fale com o agente a qualquer momento.')
                 if (msg.variables) {
                   setResolvedVars(msg.variables)
                 }
 
-                // 3. Inicia a gravação do microfone após a confirmação de pronto
+                // 3. Confirma microfone pré-aquecido (ou inicia se necessário)
                 try {
-                  const recorder = new AudioRecorder((pcm) => {
-                    if (ws.readyState === WebSocket.OPEN) {
-                      ws.send(pcm)
-                    }
-                  })
-                  await recorder.start(msg.input_sample_rate || 16000)
-                  recorderRef.current = recorder
-                  setMicStream(recorder.getStream())
+                  const micErr = await micInitPromise
+                  if (micErr) {
+                    throw micErr
+                  }
+                  if (!recorderRef.current) {
+                    const recorder = new AudioRecorder((pcm) => {
+                      if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(pcm)
+                      }
+                    })
+                    await recorder.start(msg.input_sample_rate || 16000)
+                    recorderRef.current = recorder
+                    setMicStream(recorder.getStream())
+                  }
                 } catch (micErr) {
                   setErrorMsg('Erro ao acessar microfone: ' + (micErr as Error).message)
                   hangup()

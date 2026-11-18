@@ -410,8 +410,8 @@ func (rt *Runtime) RunSessionWithOptions(
 				}
 			}
 		}
-		// Posiciona os procedimentos no TOPO e no FINAL do systemPrompt para garantir precedência sobre prompts longos
-		systemPrompt = triggerIndex.String() + "\n\n---\n\n" + systemPrompt + "\n\n" + triggerIndex.String()
+		// Posiciona os procedimentos no TOPO do systemPrompt para garantir precedência sem duplicar tokens
+		systemPrompt = triggerIndex.String() + "\n\n---\n\n" + systemPrompt + "\n\n[Lembrete: siga estritamente os procedimentos obrigatórios no topo deste prompt sempre que seus gatilhos forem acionados.]"
 
 		toolSpecs = append(toolSpecs, voice.ToolSpec{
 			Name:        "ativar_procedure",
@@ -434,11 +434,14 @@ func (rt *Runtime) RunSessionWithOptions(
 
 	// 5. Conecta com o Voice Provider
 	provSess, err := prov.Connect(ctx, voice.SessionConfig{
-		Model:        cfg.Model,
-		Voice:        cfg.Voice,
-		Language:     cfg.Language,
-		SystemPrompt: systemPrompt,
-		Tools:        toolSpecs,
+		Model:           cfg.Model,
+		DelegationModel: cfg.SystemToolsConfig.DelegationModel,
+		Voice:           cfg.Voice,
+		Language:        cfg.Language,
+		SystemPrompt:    systemPrompt,
+		FirstMessage:    firstMessage,
+		ThinkingLevel:   "",
+		Tools:           toolSpecs,
 	})
 	if err != nil {
 		rt.Log.Error("provider_connect_failed", "conversation_id", conv.ID, "provider", cfg.Provider, "error", err)
@@ -481,12 +484,14 @@ func (rt *Runtime) RunSessionWithOptions(
 		})
 	}
 
-	// 5. Inicia First Message se configurada
+	// 5. Inicia First Message se configurada (se o provider já não disparou no Connect)
 	if firstMessage != "" {
 		_ = rt.Store.RecordEvent(ctx, orgID, conv.ID, "first_message_sent", map[string]any{"text": firstMessage})
-		instruction := fmt.Sprintf("ATENÇÃO (PRIMEIRO TURNO DA LIGAÇÃO): Diga agora APENAS e EXATAMENTE a seguinte frase de saudação e aguarde em silêncio o cliente responder (NÃO fale a apresentação da empresa ainda neste turno):\n\"%s\"", firstMessage)
-		if err := provSess.SendText(instruction); err != nil {
-			rt.Log.Warn("first_message_send_failed", "conversation_id", conv.ID, "error", err)
+		if primer, ok := provSess.(voice.FirstMessagePrimer); !ok || !primer.FirstMessagePrimed() {
+			instruction := fmt.Sprintf("ATENÇÃO (PRIMEIRO TURNO DA LIGAÇÃO): Diga agora APENAS e EXATAMENTE a seguinte frase de saudação e aguarde em silêncio o cliente responder (NÃO fale a apresentação da empresa ainda neste turno):\n\"%s\"", firstMessage)
+			if err := provSess.SendText(instruction); err != nil {
+				rt.Log.Warn("first_message_send_failed", "conversation_id", conv.ID, "error", err)
+			}
 		}
 	}
 
@@ -1444,11 +1449,12 @@ func (rt *Runtime) RunSessionWithOptions(
 						}
 
 						childSess, err := childProv.Connect(sessionCtx, voice.SessionConfig{
-							Model:        targetCfg.Model,
-							Voice:        targetCfg.Voice,
-							Language:     inheritedLang,
-							SystemPrompt: childPrompt,
-							Tools:        childToolSpecs,
+							Model:           targetCfg.Model,
+							DelegationModel: targetCfg.SystemToolsConfig.DelegationModel,
+							Voice:           targetCfg.Voice,
+							Language:        inheritedLang,
+							SystemPrompt:    childPrompt,
+							Tools:           childToolSpecs,
 						})
 						if err != nil {
 							for _, ms := range newMCPSessions {
@@ -2126,7 +2132,7 @@ func (rt *Runtime) bindAgentToolsAndMCP(
 		wg.Add(1)
 		go func(toolItem store.Tool) {
 			defer wg.Done()
-			discCtx, discCancel := context.WithTimeout(ctx, 15*time.Second)
+			discCtx, discCancel := context.WithTimeout(ctx, 6*time.Second)
 			defer discCancel()
 			sess, remoteTools, discErr := tools.ConnectMCPSession(discCtx, rt.HTTPClient, toolItem, allVars)
 			mcpMu.Lock()

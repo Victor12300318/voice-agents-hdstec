@@ -13,7 +13,9 @@ type Catalog struct {
 	Provider string   `json:"provider"`
 	Label    string   `json:"label"`
 	Models   []Option `json:"models"`
-	Voices   []Option `json:"voices"`
+	// DelegationModels lista modelos opcionais usados por baixo dos panos (ex.: GPT-Live delegation.responses.model).
+	DelegationModels []Option `json:"delegation_models,omitempty"`
+	Voices           []Option `json:"voices"`
 	// Languages que o painel oferece. Se o provider não aceita um código de idioma,
 	// o runtime instrui o idioma pelo System Prompt.
 	Languages         []Option `json:"languages"`
@@ -46,12 +48,20 @@ func has(opts []Option, id string) bool {
 // SessionConfig é tudo que o provider precisa para abrir uma sessão, já resolvido
 // (Variables substituídas, idioma e índice de Procedures embutidos no prompt).
 type SessionConfig struct {
-	Model         string
-	Voice         string
-	Language      string
-	SystemPrompt  string
-	ThinkingLevel string // "low" | "medium" | "high"
-	Tools         []ToolSpec
+	Model           string
+	DelegationModel string
+	Voice           string
+	Language        string
+	SystemPrompt    string
+	FirstMessage    string
+	ThinkingLevel   string // "low" | "medium" | "high"
+	Tools           []ToolSpec
+}
+
+// FirstMessagePrimer pode ser implementado por uma voice.Session que já dispara
+// a primeira fala imediatamente durante o Connect, evitando round-trip extra no runtime.
+type FirstMessagePrimer interface {
+	FirstMessagePrimed() bool
 }
 
 // ToolSpec é a declaração provider-agnóstica de uma função chamável pelo modelo.

@@ -104,6 +104,16 @@ const FALLBACK_CATALOGS: ProviderCatalog[] = [
       { id: 'gpt-realtime-mini', label: 'GPT Realtime Mini', description: 'Compacto e econômico' },
       { id: 'gpt-realtime-1.5', label: 'GPT Realtime 1.5', description: 'Versão 1.5' },
     ],
+    delegation_models: [
+      { id: 'gpt-4.1-mini', label: 'GPT-4.1 Mini', description: 'Padrão equilibrado — rápido e preciso para ferramentas e procedimentos', default: true },
+      { id: 'gpt-4.1-nano', label: 'GPT-4.1 Nano', description: 'Ultra-rápido e econômico — menor latência na execução de tarefas' },
+      { id: 'gpt-4.1', label: 'GPT-4.1', description: 'Máxima precisão para regras complexas e múltiplos procedimentos' },
+      { id: 'gpt-4o-mini', label: 'GPT-4o Mini', description: 'Leve e rápido para fluxos simples' },
+      { id: 'gpt-4o', label: 'GPT-4o', description: 'Modelo completo para raciocínio geral' },
+      { id: 'gpt-5-mini', label: 'GPT-5 Mini', description: 'Nova geração equilibrada para tarefas e ferramentas' },
+      { id: 'gpt-5-nano', label: 'GPT-5 Nano', description: 'Nova geração ultra-rápida e econômica' },
+      { id: 'gpt-5', label: 'GPT-5', description: 'Nova geração com máxima capacidade de raciocínio' },
+    ],
     voices: [
       { id: 'bossa', label: 'Bossa (PT-BR)', default: true },
       { id: 'tempo', label: 'Tempo (PT-BR)' },
@@ -369,6 +379,7 @@ export default function AgentEditor() {
   // Nova variável dinâmica no drawer { } Variáveis
   const [newVarName, setNewVarName] = useState('')
   const [newVarDesc, setNewVarDesc] = useState('')
+  const [customDelegationModel, setCustomDelegationModel] = useState('')
 
   // Teste interativo do Initiation Webhook (Twilio Personalization)
   const [testCallerID, setTestCallerID] = useState('+5511999998888')
@@ -745,7 +756,9 @@ export default function AgentEditor() {
 
   const startLiveTest = async () => {
     if (!id || !form) return
-    await saveDraft()
+    if (hasUnsavedDraft) {
+      await saveDraft()
+    }
     setIsTestDrawerOpen(true)
     stopAudioResources()
     setTranscripts([])
@@ -766,6 +779,7 @@ export default function AgentEditor() {
       }
       playerRef.current = player
 
+      let wsReady = false
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
       const branchQuery = detail?.versioning_enabled && activeBranchId
         ? `&branch_id=${encodeURIComponent(activeBranchId)}`
@@ -775,20 +789,38 @@ export default function AgentEditor() {
       ws.binaryType = 'arraybuffer'
       wsRef.current = ws
 
+      // Pré-aquece o microfone e o AudioWorklet em paralelo com o handshake do provedor
+      const rec = new AudioRecorder((pcm) => {
+        if (wsReady && ws.readyState === WebSocket.OPEN) ws.send(pcm)
+      })
+      const micInitPromise = rec.start(currentCatalog.input_sample_rate || 16000)
+        .then(() => {
+          if (wsRef.current !== ws) {
+            rec.stop()
+            return
+          }
+          recorderRef.current = rec
+        })
+        .catch(() => {})
+
       ws.onmessage = async (event) => {
         if (typeof event.data === 'string') {
           try {
             const data = JSON.parse(event.data)
             if (data.type === 'ready') {
+              wsReady = true
               setCallStatus('active')
               timerRef.current = setInterval(() => {
                 setCallDuration((d) => d + 1)
               }, 1000)
-              const rec = new AudioRecorder((pcm) => {
-                if (ws.readyState === WebSocket.OPEN) ws.send(pcm)
-              })
-              await rec.start(data.input_sample_rate || 16000)
-              recorderRef.current = rec
+              await micInitPromise
+              if (!recorderRef.current) {
+                const fallbackRec = new AudioRecorder((pcm) => {
+                  if (ws.readyState === WebSocket.OPEN) ws.send(pcm)
+                })
+                await fallbackRec.start(data.input_sample_rate || 16000)
+                recorderRef.current = fallbackRec
+              }
             } else if (data.type === 'caller_transcript' && data.text) {
               const rawOrig = String(data.text)
               const hasLeading = /^\s/.test(rawOrig)
@@ -1542,13 +1574,23 @@ export default function AgentEditor() {
 
                     <button
                       type="button"
-                      onClick={() => setActiveRightDrawer('llm')}
+                      onClick={() => {
+                        setCustomDelegationModel(form.system_tools_config?.delegation_model || '')
+                        setActiveRightDrawer('llm')
+                      }}
                       className="w-full px-3.5 py-3 bg-white hover:bg-zinc-50 border border-zinc-200/90 rounded-2xl shadow-2xs flex items-center justify-between text-xs transition-colors text-left"
                     >
-                      <span className="font-semibold text-zinc-900 flex items-center gap-1.5 truncate">
-                        {currentModelObj.label}
-                        <Info className="w-3.5 h-3.5 text-zinc-400 flex-shrink-0" />
-                      </span>
+                      <div className="min-w-0">
+                        <span className="font-semibold text-zinc-900 flex items-center gap-1.5 truncate">
+                          {currentModelObj.label}
+                          <Info className="w-3.5 h-3.5 text-zinc-400 flex-shrink-0" />
+                        </span>
+                        {form.model.startsWith('gpt-live') && (
+                          <span className="block text-[11px] text-zinc-500 mt-0.5 truncate">
+                            Tarefas: {form.system_tools_config?.delegation_model || 'gpt-4.1-mini'}
+                          </span>
+                        )}
+                      </div>
                       <ChevronRight className="w-3.5 h-3.5 text-zinc-400 flex-shrink-0" />
                     </button>
                   </div>
@@ -2465,6 +2507,91 @@ export default function AgentEditor() {
                 })}
               </div>
             </div>
+
+            {form.model.startsWith('gpt-live') && (
+              <div className="space-y-3 pt-4 border-t border-zinc-100 pb-4">
+                <div>
+                  <label className="block font-semibold text-zinc-900">
+                    Modelo de Execução de Tarefas (Delegation)
+                  </label>
+                  <p className="text-[11px] text-zinc-500 mt-0.5 leading-relaxed">
+                    Modelo usado nos bastidores pelo GPT-Live para raciocínio, procedimentos e chamada de ferramentas/MCPs.
+                  </p>
+                </div>
+
+                <div className="space-y-2">
+                  {(
+                    currentCatalog.delegation_models ||
+                    FALLBACK_CATALOGS[1].delegation_models ||
+                    []
+                  ).map((dm) => {
+                    const activeDelegation =
+                      form.system_tools_config?.delegation_model || 'gpt-4.1-mini'
+                    const isSelected = activeDelegation === dm.id
+                    return (
+                      <button
+                        key={dm.id}
+                        type="button"
+                        onClick={() => {
+                          const nextCfg = {
+                            ...(form.system_tools_config || {}),
+                            delegation_model: dm.id,
+                          }
+                          setCustomDelegationModel(dm.id)
+                          updateFormField({ system_tools_config: nextCfg })
+                          saveDraft({ system_tools_config: nextCfg })
+                        }}
+                        className={`w-full p-3 rounded-2xl border text-left flex items-center justify-between gap-3 transition-all cursor-pointer ${
+                          isSelected
+                            ? 'border-zinc-900 bg-zinc-50 ring-1 ring-zinc-900'
+                            : 'border-zinc-200 hover:border-zinc-300'
+                        }`}
+                      >
+                        <div className="min-w-0">
+                          <div className="font-semibold text-zinc-900">{dm.label}</div>
+                          <div className="text-[11px] font-mono text-zinc-400">{dm.id}</div>
+                          {dm.description && (
+                            <div className="text-[11px] text-zinc-500 mt-0.5">{dm.description}</div>
+                          )}
+                        </div>
+                        {isSelected && <Check className="w-4 h-4 text-zinc-900 flex-shrink-0" />}
+                      </button>
+                    )
+                  })}
+                </div>
+
+                <div className="pt-1 space-y-1.5">
+                  <label className="block text-[11px] font-medium text-zinc-600">
+                    Ou informe outro ID de modelo OpenAI (Responses API)
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={customDelegationModel}
+                      onChange={(e) => setCustomDelegationModel(e.target.value)}
+                      placeholder="ex: gpt-4.1-mini, gpt-5-mini, o4-mini"
+                      className="flex-1 px-3 py-1.5 bg-white border border-zinc-200 rounded-xl font-mono text-xs text-zinc-900 focus:outline-none focus:border-zinc-400"
+                    />
+                    <Button
+                      size="sm"
+                      type="button"
+                      disabled={!customDelegationModel.trim()}
+                      onClick={() => {
+                        const modelId = customDelegationModel.trim()
+                        const nextCfg = {
+                          ...(form.system_tools_config || {}),
+                          delegation_model: modelId,
+                        }
+                        updateFormField({ system_tools_config: nextCfg })
+                        saveDraft({ system_tools_config: nextCfg })
+                      }}
+                    >
+                      Aplicar
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </Sheet>

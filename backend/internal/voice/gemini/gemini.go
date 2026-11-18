@@ -140,6 +140,12 @@ func (p *Provider) Connect(ctx context.Context, cfg voice.SessionConfig) (voice.
 	}
 	sess := &session{s: s, events: make(chan voice.Event, 256)}
 	go sess.readLoop()
+	if fm := strings.TrimSpace(cfg.FirstMessage); fm != "" {
+		instruction := fmt.Sprintf("ATENÇÃO (PRIMEIRO TURNO DA LIGAÇÃO): Diga agora APENAS e EXATAMENTE a seguinte frase de saudação e aguarde em silêncio o cliente responder (NÃO fale a apresentação da empresa ainda neste turno):\n%q", fm)
+		if err := sess.SendText(instruction); err == nil {
+			sess.firstMessagePrimed = true
+		}
+	}
 	return sess, nil
 }
 
@@ -187,9 +193,12 @@ type session struct {
 	s      *genai.Session
 	events chan voice.Event
 
-	mu     sync.Mutex
-	closed bool
+	mu                 sync.Mutex
+	closed             bool
+	firstMessagePrimed bool
 }
+
+func (s *session) FirstMessagePrimed() bool { return s.firstMessagePrimed }
 
 func (s *session) SendAudio(pcm []byte) error {
 	return s.s.SendRealtimeInput(genai.LiveRealtimeInput{
