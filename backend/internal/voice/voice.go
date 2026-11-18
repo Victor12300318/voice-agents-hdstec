@@ -45,18 +45,31 @@ func has(opts []Option, id string) bool {
 	return false
 }
 
+// SkillSummary descreve resumidamente um Procedimento/Skill do Reasoner para o Speaker saber quando delegar
+// sem expor o corpo completo do procedimento ao modelo de fala (arquitetura Speaker + Reasoner estilo Vapi).
+type SkillSummary struct {
+	Name        string
+	Description string
+}
+
 // SessionConfig é tudo que o provider precisa para abrir uma sessão, já resolvido
 // (Variables substituídas, idioma e índice de Procedures embutidos no prompt).
 type SessionConfig struct {
-	Model           string
-	DelegationModel string
-	Voice           string
-	Language        string
-	SystemPrompt    string
-	VoicePrompt     string
-	FirstMessage    string
-	ThinkingLevel   string // "low" | "medium" | "high"
-	Tools           []ToolSpec
+	AgentName        string
+	Model            string
+	DelegationModel  string
+	ReasoningEffort  string // "none" | "low" | "medium" | "high"
+	Voice            string
+	Language         string
+	SystemPrompt     string
+	VoicePrompt      string
+	SpeakerPrompt    string
+	ReasonerPrompt   string
+	PersonalityPacks []string
+	SkillSummaries   []SkillSummary
+	FirstMessage     string
+	ThinkingLevel    string // "low" | "medium" | "high"
+	Tools            []ToolSpec
 }
 
 // FirstMessagePrimer pode ser implementado por uma voice.Session que já dispara

@@ -38,9 +38,12 @@ type GuardianJevConfig struct {
 }
 
 type SystemToolsConfig struct {
-	TransferToAgent *TransferToAgentToolConfig `json:"transfer_to_agent,omitempty"`
-	GuardianJev     *GuardianJevConfig         `json:"guardian_jev,omitempty"`
-	DelegationModel string                     `json:"delegation_model,omitempty"`
+	TransferToAgent  *TransferToAgentToolConfig `json:"transfer_to_agent,omitempty"`
+	GuardianJev      *GuardianJevConfig         `json:"guardian_jev,omitempty"`
+	DelegationModel  string                     `json:"delegation_model,omitempty"`
+	SpeakerPrompt    string                     `json:"speaker_prompt,omitempty"`
+	PersonalityPacks []string                   `json:"personality_packs,omitempty"`
+	ReasoningEffort  string                     `json:"reasoning_effort,omitempty"`
 }
 
 // AgentConfig é o que uma Agent Version congela (ADR 0002): tudo que é do Agent,
@@ -135,7 +138,7 @@ func mergeReferencedVariables(declared []variables.Declared, texts ...string) []
 }
 
 func (s *Store) UpdateAgent(ctx context.Context, orgID, id string, u AgentUpdate) (Agent, error) {
-	u.Variables = mergeReferencedVariables(u.Variables, u.SystemPrompt, u.FirstMessage)
+	u.Variables = mergeReferencedVariables(u.Variables, u.SystemPrompt, u.FirstMessage, u.SystemToolsConfig.SpeakerPrompt)
 	if u.SystemTools == nil {
 		u.SystemTools = []string{}
 	}

@@ -127,25 +127,46 @@ func TestOpenAILiveDispatchMarksFirstOutputAudio(t *testing.T) {
 }
 
 func TestOpenAILiveSpawnThinkingPolicyAndModelResolution(t *testing.T) {
-	if got := resolveDelegationModel(""); got != "gpt-6-luna" {
-		t.Fatalf("esperava gpt-6-luna como padrão, veio %s", got)
+	if got := resolveDelegationModel(""); got != "gpt-5.6-terra" {
+		t.Fatalf("esperava gpt-5.6-terra como padrão estilo Vapi, veio %s", got)
 	}
-	if got := resolveDelegationModel("gpt-4.1-nano"); got != "gpt-6-luna" {
-		t.Fatalf("esperava redirecionamento de modelo encerrado para gpt-6-luna, veio %s", got)
+	if got := resolveDelegationModel("gpt-4.1-nano"); got != "gpt-5.6-terra" {
+		t.Fatalf("esperava redirecionamento de modelo encerrado para gpt-5.6-terra, veio %s", got)
 	}
 
-	prompt := buildLiveFrontendInstructions(voice.SessionConfig{
-		Language:    "pt-BR",
-		VoicePrompt: "Você é a Lívia da GEAP.",
-		Tools: []voice.ToolSpec{
-			{Name: "consultar_cpf", Description: "Consulta beneficiário pelo CPF"},
+	classicPrompt := "# Personality\nVocê é a Lívia, assistente cordial da GEAP.\n\n# Actions\n1. Chame consultar_beneficiario_migracao passando o CPF."
+	cfg := voice.SessionConfig{
+		AgentName:      "Lívia",
+		Language:       "pt-BR",
+		VoicePrompt:    classicPrompt,
+		ReasonerPrompt: "## SKILLS:\n### PROCEDIMENTO: Segunda Via\n1. Valide CPF em consultar_beneficiario_migracao\n\n" + classicPrompt,
+		SkillSummaries: []voice.SkillSummary{
+			{Name: "Segunda Via de Boletos", Description: "Quando o cliente pedir segunda via de boleto"},
 		},
-	}, "Boa tarde, sou a Lívia.")
-
-	if !strings.Contains(prompt, "<|SpawnThinking|>") {
-		t.Fatal("esperava token oficial <|SpawnThinking|> nas instruções do GPT-Live")
+		PersonalityPacks: []string{"unhurried", "patient-numbers"},
+		Tools: []voice.ToolSpec{
+			{Name: "ativar_procedure", Description: "Interna"},
+			{Name: "consultar_beneficiario_migracao", Description: "Consulta beneficiário pelo CPF"},
+		},
 	}
-	if !strings.Contains(prompt, "consultar_cpf") {
-		t.Fatal("esperava ferramenta consultar_cpf listada em Backend tools")
+
+	speakerPrompt := buildLiveSpeakerInstructions(cfg, "Boa tarde, sou a Lívia.")
+	reasonerPrompt := buildLiveReasonerInstructions(cfg)
+
+	if !strings.Contains(speakerPrompt, "<|SpawnThinking|>") {
+		t.Fatal("esperava token oficial <|SpawnThinking|> nas instruções do Speaker")
+	}
+	if strings.Contains(speakerPrompt, "# Actions") {
+		t.Fatal("seção # Actions de regras/ferramentas não deve vazar para o Speaker")
+	}
+	if !strings.Contains(speakerPrompt, "Procedure [Segunda Via de Boletos]") {
+		t.Fatal("esperava resumo curto de 1 linha da Skill no Speaker")
+	}
+	if !strings.Contains(reasonerPrompt, "PROCEDIMENTO: Segunda Via") {
+		t.Fatal("esperava procedimento completo dentro do Reasoner")
+	}
+	liveTools := openAILiveTools(cfg.Tools)
+	if len(liveTools) != 1 || liveTools[0]["name"] != "consultar_beneficiario_migracao" {
+		t.Fatalf("esperava apenas ferramentas reais no Reasoner sem ativar_procedure, veio %+v", liveTools)
 	}
 }

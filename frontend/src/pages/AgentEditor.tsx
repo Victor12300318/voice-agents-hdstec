@@ -105,15 +105,15 @@ const FALLBACK_CATALOGS: ProviderCatalog[] = [
       { id: 'gpt-realtime-1.5', label: 'GPT Realtime 1.5', description: 'Versão 1.5' },
     ],
     delegation_models: [
-      { id: 'gpt-6-luna', label: 'GPT-6 Luna', description: 'Recomendado pela OpenAI para GPT-Live — ultra-rápido e econômico para tools e procedimentos', default: true },
-      { id: 'gpt-6.2-sol', label: 'GPT-6.2 Sol', description: 'Equilíbrio ideal entre inteligência e velocidade para agentes em escala' },
-      { id: 'gpt-6-sol', label: 'GPT-6 Sol', description: 'Especializado em fluxos agênticos complexos e múltiplas ferramentas' },
+      { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra (Padrão Reasoner)', description: 'Padrão estilo Vapi — equilíbrio ideal entre raciocínio, CPF/procedimentos e baixa latência', default: true },
+      { id: 'gpt-6-luna', label: 'GPT-6 Luna', description: 'Ultra-rápido e econômico para alto volume' },
+      { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', description: 'Máxima precisão na série 5.6 para procedimentos complexos' },
+      { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna', description: 'Baixa latência e custo reduzido (série 5.6)' },
+      { id: 'gpt-6.2-sol', label: 'GPT-6.2 Sol', description: 'Modelo avançado série 6.2 para agentes em escala' },
+      { id: 'gpt-6-sol', label: 'GPT-6 Sol', description: 'Especializado em fluxos agênticos e múltiplas ferramentas' },
       { id: 'gpt-6.1-terra', label: 'GPT-6.1 Terra', description: 'Rápido e preciso para procedimentos estruturados' },
       { id: 'gpt-6.2-astra', label: 'GPT-6.2 Astra', description: 'Máxima capacidade de raciocínio para regras críticas' },
-      { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna', description: 'Baixa latência otimizado para alto volume (série 5.6)' },
-      { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra', description: 'Equilibrado em inteligência e custo (série 5.6)' },
-      { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini', description: 'Modelo Mini ágil para subagentes e chamada de ferramentas' },
-      { id: 'gpt-5.4', label: 'GPT-5.4', description: 'Modelo completo série 5.4' },
+      { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini', description: 'Modelo Mini ágil para subagentes e ferramentas' },
       { id: 'gpt-4.1-mini', label: 'GPT-4.1 Mini (Legado)', description: 'Compatibilidade com projetos legados' },
     ],
     voices: [
@@ -382,6 +382,7 @@ export default function AgentEditor() {
   const [newVarName, setNewVarName] = useState('')
   const [newVarDesc, setNewVarDesc] = useState('')
   const [customDelegationModel, setCustomDelegationModel] = useState('')
+  const [gptLivePromptTab, setGptLivePromptTab] = useState<'speaker' | 'reasoner'>('speaker')
 
   // Teste interativo do Initiation Webhook (Twilio Personalization)
   const [testCallerID, setTestCallerID] = useState('+5511999998888')
@@ -515,6 +516,7 @@ export default function AgentEditor() {
     const seen = new Set(existing.map((v) => v.name))
     const allTexts = [
       baseForm.system_prompt || '',
+      baseForm.system_tools_config?.speaker_prompt || '',
       baseForm.first_message || '',
       ...skills.map((s) => `${s.content || ''} ${s.trigger || ''} ${(s.guardrails || []).join(' ')}`),
     ].join('\n')
@@ -1405,24 +1407,273 @@ export default function AgentEditor() {
 
               {/* GRID DE 2 COLUNAS ASSIMÉTRICAS (Esquerda: Prompts | Direita: Vozes, Idioma, LLM, Comportamento) */}
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-                {/* COLUNA ESQUERDA (8 colunas): Prompt do sistema + Primeira mensagem */}
+                {/* COLUNA ESQUERDA (8 colunas): Prompt do sistema (ou Speaker + Reasoner no GPT-Live) + Primeira mensagem */}
                 <div className="lg:col-span-7 xl:col-span-8 space-y-6">
-                  <RichPromptCard
-                    title="Prompt do sistema"
-                    showBookIcon={true}
-                    showWandButton={true}
-                    shadedBg={true}
-                    value={form.system_prompt}
-                    onChange={(next) => updateFormField({ system_prompt: next })}
-                    placeholder="# Role\nVocê é uma consultora especialista em atendimento. Sua missão é resolver a solicitação do cliente de forma ágil, empática e segura..."
-                    rows={10}
-                    declaredVariables={form.variables || []}
-                    timezone={form.timezone}
-                    onTimezoneChange={(tz) => {
-                      updateFormField({ timezone: tz })
-                      saveDraft({ timezone: tz })
-                    }}
-                  />
+                  {form.model.startsWith('gpt-live') ? (
+                    <div className="space-y-4">
+                      {/* Seletor estilo Vapi: Speaker vs Reasoner */}
+                      <div className="bg-zinc-100/90 border border-zinc-200/80 rounded-2xl p-2 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                        <div className="inline-flex bg-white/80 p-1 rounded-xl border border-zinc-200/70 gap-1">
+                          <button
+                            type="button"
+                            onClick={() => setGptLivePromptTab('speaker')}
+                            className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+                              gptLivePromptTab === 'speaker'
+                                ? 'bg-zinc-900 text-white shadow-xs'
+                                : 'text-zinc-600 hover:text-zinc-900'
+                            }`}
+                          >
+                            <Mic className="w-3.5 h-3.5" />
+                            Speaker (Voz & Fala)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setGptLivePromptTab('reasoner')}
+                            className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+                              gptLivePromptTab === 'reasoner'
+                                ? 'bg-zinc-900 text-white shadow-xs'
+                                : 'text-zinc-600 hover:text-zinc-900'
+                            }`}
+                          >
+                            <Sparkles className="w-3.5 h-3.5" />
+                            Reasoner (Raciocínio & Skills)
+                          </button>
+                        </div>
+
+                        <div className="flex items-center gap-2 text-[11px] text-zinc-600 px-1">
+                          <button
+                            type="button"
+                            onClick={() => setCurrentTab('skills')}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white border border-zinc-200/80 hover:border-zinc-300 text-zinc-700 font-medium cursor-pointer"
+                          >
+                            <ListTree className="w-3 h-3 text-zinc-500" />
+                            {skills.filter((s) => s.active).length} Skills no Reasoner
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setCurrentTab('tools')}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white border border-zinc-200/80 hover:border-zinc-300 text-zinc-700 font-medium cursor-pointer"
+                          >
+                            <Wrench className="w-3 h-3 text-zinc-500" />
+                            {(form.tools || []).length} Tools no Reasoner
+                          </button>
+                        </div>
+                      </div>
+
+                      {gptLivePromptTab === 'speaker' ? (
+                        <div className="space-y-3">
+                          {!(form.system_tools_config?.speaker_prompt || '').trim() && (
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 py-3 rounded-2xl bg-amber-50/80 border border-amber-200/80 text-xs text-amber-900">
+                              <div className="leading-relaxed">
+                                <span className="font-semibold">Modo automático Speaker/Reasoner ativo:</span>{' '}
+                                enquanto o Speaker estiver vazio, apenas a identidade/tom é enviada ao modelo de fala e todos os{' '}
+                                <span className="font-semibold">Procedimentos e Tools ficam exclusivamente no Reasoner</span>.
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const raw = form.system_prompt || ''
+                                  const lines = raw.split('\n')
+                                  const speakerLines: string[] = []
+                                  const reasonerLines: string[] = []
+                                  let target: 'speaker' | 'reasoner' = 'speaker'
+                                  for (const line of lines) {
+                                    const t = line.trim()
+                                    if (t.startsWith('#')) {
+                                      const h = t.replace(/^#+/, '').trim().toLowerCase()
+                                      const isSpk =
+                                        h.includes('personal') ||
+                                        h.includes('role') ||
+                                        h.includes('papel') ||
+                                        h.includes('identidade') ||
+                                        h.includes('tone') ||
+                                        h.includes('tom') ||
+                                        h.includes('style') ||
+                                        h.includes('estilo') ||
+                                        h.includes('environment') ||
+                                        h.includes('ambiente') ||
+                                        h.includes('pronunc') ||
+                                        h.includes('pronúnc')
+                                      target = isSpk ? 'speaker' : 'reasoner'
+                                    }
+                                    if (target === 'speaker') speakerLines.push(line)
+                                    else reasonerLines.push(line)
+                                  }
+                                  const extractedSpeaker =
+                                    speakerLines.join('\n').trim() ||
+                                    `Você é ${form.name}, assistente virtual cordial e prestativa.\nFale em português do Brasil com frases curtas e claras, fazendo uma pergunta por vez.\nAguarde em silêncio completo enquanto o cliente dita números ou CPF.`
+                                  const extractedReasoner = reasonerLines.join('\n').trim() || raw
+                                  const nextCfg = {
+                                    ...(form.system_tools_config || {}),
+                                    speaker_prompt: extractedSpeaker,
+                                  }
+                                  updateFormField({
+                                    system_prompt: extractedReasoner,
+                                    system_tools_config: nextCfg,
+                                  })
+                                }}
+                                className="px-3 py-1.5 rounded-xl bg-amber-900 text-white font-semibold text-[11px] hover:bg-amber-950 transition-colors flex-shrink-0 cursor-pointer"
+                              >
+                                Separar Prompt (Speaker / Reasoner)
+                              </button>
+                            </div>
+                          )}
+
+                          <RichPromptCard
+                            title="Prompt do Speaker (Voz, Tom e Condução)"
+                            subtitle="Define APENAS como o GPT-Live fala, escuta, faz pausas e conduz a conversa. Não coloque procedimentos nem regras de tools aqui."
+                            showBookIcon={true}
+                            showWandButton={true}
+                            shadedBg={true}
+                            value={form.system_tools_config?.speaker_prompt || ''}
+                            onChange={(next) =>
+                              updateFormField({
+                                system_tools_config: {
+                                  ...(form.system_tools_config || {}),
+                                  speaker_prompt: next,
+                                },
+                              })
+                            }
+                            placeholder={`Você é ${form.name || 'a assistente'}, atendente virtual cordial.\nFale de forma acolhedora, clara e direta, em uma ou duas frases curtas por vez.\nFaça apenas uma pergunta por vez e use os dados que o cliente já informou.\nQuando pedir CPF ou números, aguarde em silêncio até o cliente terminar todos os dígitos.`}
+                            rows={8}
+                            declaredVariables={form.variables || []}
+                            timezone={form.timezone}
+                            onTimezoneChange={(tz) => {
+                              updateFormField({ timezone: tz })
+                              saveDraft({ timezone: tz })
+                            }}
+                          />
+
+                          {/* Personality Packs estilo Vapi */}
+                          <div className="bg-white border border-zinc-200/90 rounded-2xl p-4 space-y-2.5">
+                            <div className="flex items-center justify-between">
+                              <span className="text-xs font-semibold text-zinc-900">
+                                Personality Packs do Speaker (Estilo de Fala)
+                              </span>
+                              <span className="text-[11px] text-zinc-400">Opcional</span>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              {[
+                                { id: 'unhurried', label: 'Unhurried (Calmo e claro)' },
+                                { id: 'patient-numbers', label: 'Paciência em CPF/Números' },
+                                { id: 'eager-listener', label: 'Ouvinte atento' },
+                                { id: 'bouncy', label: 'Expressivo e caloroso' },
+                              ].map((pack) => {
+                                const curPacks = form.system_tools_config?.personality_packs || []
+                                const active = curPacks.includes(pack.id)
+                                return (
+                                  <button
+                                    key={pack.id}
+                                    type="button"
+                                    onClick={() => {
+                                      const nextPacks = active
+                                        ? curPacks.filter((x) => x !== pack.id)
+                                        : [...curPacks, pack.id]
+                                      const nextCfg = {
+                                        ...(form.system_tools_config || {}),
+                                        personality_packs: nextPacks,
+                                      }
+                                      updateFormField({ system_tools_config: nextCfg })
+                                      saveDraft({ system_tools_config: nextCfg })
+                                    }}
+                                    className={`px-3 py-1.5 rounded-xl text-[11px] font-medium border transition-all cursor-pointer ${
+                                      active
+                                        ? 'bg-zinc-900 text-white border-zinc-900'
+                                        : 'bg-zinc-50 text-zinc-700 border-zinc-200 hover:border-zinc-300'
+                                    }`}
+                                  >
+                                    {pack.label}
+                                  </button>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="space-y-3">
+                          <div className="bg-white border border-zinc-200/90 rounded-2xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs">
+                            <div className="flex items-center gap-2 text-zinc-700">
+                              <span className="font-semibold text-zinc-900">Modelo Reasoner:</span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setCustomDelegationModel(
+                                    form.system_tools_config?.delegation_model || 'gpt-5.6-terra',
+                                  )
+                                  setActiveRightDrawer('llm')
+                                }}
+                                className="px-2.5 py-1 rounded-lg bg-zinc-100 hover:bg-zinc-200 font-mono text-[11px] text-zinc-900 transition-colors cursor-pointer"
+                              >
+                                {form.system_tools_config?.delegation_model || 'gpt-5.6-terra'}
+                              </button>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-[11px] text-zinc-500">Esforço:</span>
+                              {(['none', 'low', 'medium', 'high'] as const).map((eff) => {
+                                const curEff = form.system_tools_config?.reasoning_effort || 'low'
+                                return (
+                                  <button
+                                    key={eff}
+                                    type="button"
+                                    onClick={() => {
+                                      const nextCfg = {
+                                        ...(form.system_tools_config || {}),
+                                        reasoning_effort: eff,
+                                      }
+                                      updateFormField({ system_tools_config: nextCfg })
+                                      saveDraft({ system_tools_config: nextCfg })
+                                    }}
+                                    className={`px-2 py-0.5 rounded-md text-[11px] font-mono border cursor-pointer ${
+                                      curEff === eff
+                                        ? 'bg-zinc-900 text-white border-zinc-900'
+                                        : 'bg-white text-zinc-600 border-zinc-200 hover:border-zinc-300'
+                                    }`}
+                                  >
+                                    {eff}
+                                  </button>
+                                )
+                              })}
+                            </div>
+                          </div>
+
+                          <RichPromptCard
+                            title="Prompt do Reasoner (Raciocínio, Regras e Ferramentas)"
+                            subtitle="Executado pelo modelo delegado junto com todos os seus Procedimentos (Reasoner Skills) e Ferramentas/MCPs."
+                            showBookIcon={true}
+                            showWandButton={true}
+                            shadedBg={true}
+                            value={form.system_prompt}
+                            onChange={(next) => updateFormField({ system_prompt: next })}
+                            placeholder="# Regras do Reasoner\nTrabalhe a partir da transcrição mais recente. Valide os dados obrigatórios antes de acionar as ferramentas e retorne fatos curtos e diretos para o Speaker comunicar ao cliente..."
+                            rows={10}
+                            declaredVariables={form.variables || []}
+                            timezone={form.timezone}
+                            onTimezoneChange={(tz) => {
+                              updateFormField({ timezone: tz })
+                              saveDraft({ timezone: tz })
+                            }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <RichPromptCard
+                      title="Prompt do sistema"
+                      showBookIcon={true}
+                      showWandButton={true}
+                      shadedBg={true}
+                      value={form.system_prompt}
+                      onChange={(next) => updateFormField({ system_prompt: next })}
+                      placeholder="# Role\nVocê é uma consultora especialista em atendimento. Sua missão é resolver a solicitação do cliente de forma ágil, empática e segura..."
+                      rows={10}
+                      declaredVariables={form.variables || []}
+                      timezone={form.timezone}
+                      onTimezoneChange={(tz) => {
+                        updateFormField({ timezone: tz })
+                        saveDraft({ timezone: tz })
+                      }}
+                    />
+                  )}
 
                   <RichPromptCard
                     title="Primeira mensagem"
@@ -1596,7 +1847,7 @@ export default function AgentEditor() {
                         </span>
                         {form.model.startsWith('gpt-live') && (
                           <span className="block text-[11px] text-zinc-500 mt-0.5 truncate">
-                            Tarefas: {form.system_tools_config?.delegation_model || 'gpt-6-luna'}
+                            Reasoner: {form.system_tools_config?.delegation_model || 'gpt-5.6-terra'} ({form.system_tools_config?.reasoning_effort || 'low'})
                           </span>
                         )}
                       </div>
@@ -2521,11 +2772,41 @@ export default function AgentEditor() {
               <div className="space-y-3 pt-4 border-t border-zinc-100 pb-4">
                 <div>
                   <label className="block font-semibold text-zinc-900">
-                    Modelo de Execução de Tarefas (Delegation)
+                    Modelo do Reasoner (Raciocínio, Procedimentos & Tools)
                   </label>
                   <p className="text-[11px] text-zinc-500 mt-0.5 leading-relaxed">
-                    Modelo usado nos bastidores pelo GPT-Live para raciocínio, procedimentos e chamada de ferramentas/MCPs.
+                    Modelo separado que executa seus procedimentos (Reasoner Skills) e ferramentas enquanto o Speaker conduz a conversa.
                   </p>
+                </div>
+
+                <div className="flex items-center justify-between bg-zinc-50 border border-zinc-200/80 rounded-xl px-3 py-2">
+                  <span className="text-[11px] font-medium text-zinc-700">Reasoning Effort</span>
+                  <div className="flex items-center gap-1">
+                    {(['none', 'low', 'medium', 'high'] as const).map((eff) => {
+                      const curEff = form.system_tools_config?.reasoning_effort || 'low'
+                      return (
+                        <button
+                          key={eff}
+                          type="button"
+                          onClick={() => {
+                            const nextCfg = {
+                              ...(form.system_tools_config || {}),
+                              reasoning_effort: eff,
+                            }
+                            updateFormField({ system_tools_config: nextCfg })
+                            saveDraft({ system_tools_config: nextCfg })
+                          }}
+                          className={`px-2 py-0.5 rounded-md text-[11px] font-mono border cursor-pointer ${
+                            curEff === eff
+                              ? 'bg-zinc-900 text-white border-zinc-900'
+                              : 'bg-white text-zinc-600 border-zinc-200 hover:border-zinc-300'
+                          }`}
+                        >
+                          {eff}
+                        </button>
+                      )
+                    })}
+                  </div>
                 </div>
 
                 <div className="space-y-2">
@@ -2535,7 +2816,7 @@ export default function AgentEditor() {
                     []
                   ).map((dm) => {
                     const activeDelegation =
-                      form.system_tools_config?.delegation_model || 'gpt-6-luna'
+                      form.system_tools_config?.delegation_model || 'gpt-5.6-terra'
                     const isSelected = activeDelegation === dm.id
                     return (
                       <button

@@ -218,7 +218,10 @@ func (rt *Runtime) prepareSession(
 	}
 
 	firstMessage := variables.Render(cfg.FirstMessage, ps.allVars)
-	systemPrompt := variables.Render(cfg.SystemPrompt, ps.allVars)
+	rawRenderedPrompt := variables.Render(cfg.SystemPrompt, ps.allVars)
+	speakerExplicitPrompt := variables.Render(cfg.SystemToolsConfig.SpeakerPrompt, ps.allVars)
+
+	systemPrompt := rawRenderedPrompt
 	if cfg.Language != "" {
 		systemPrompt += fmt.Sprintf("\n\nDIRETRIZ DE IDIOMA: Responda obrigatoriamente no idioma configurado (%s). Fale em ritmo ágil, natural e fluido. Tags entre colchetes como [super fast] são marcações de ritmo de fala e jamais devem ser lidas em voz alta.", cfg.Language)
 	}
@@ -280,6 +283,7 @@ func (rt *Runtime) prepareSession(
 
 	procExpander := procedures.NewExpander(rt.Store)
 	systemPrompt = procExpander.ExpandInlineReferences(ctx, orgID, systemPrompt, ps.procsMap, ps.promptReferencedTools)
+	reasonerPrompt := procExpander.ExpandInlineReferences(ctx, orgID, rawRenderedPrompt, ps.procsMap, ps.promptReferencedTools)
 
 	for _, st := range cfg.SystemTools {
 		if st == "encerrar_conversa" {
@@ -326,6 +330,7 @@ func (rt *Runtime) prepareSession(
 					}
 					transferDesc += " " + rulesPrompt.String()
 					systemPrompt += rulesPrompt.String()
+					reasonerPrompt += rulesPrompt.String()
 				}
 			}
 			transferParams := []voice.Param{
@@ -347,23 +352,23 @@ func (rt *Runtime) prepareSession(
 		}
 	}
 
-	baseVoicePrompt := systemPrompt
+	var skillSummaries []voice.SkillSummary
 
 	if len(ps.entryProcedures) > 0 {
 		var triggerIndex strings.Builder
-		var compactVoiceProcs strings.Builder
 		var procNamesList []string
-		triggerIndex.WriteString("## PROCEDIMENTOS E GATILHOS OBRIGATÓRIOS DO AGENTE (PRIORIDADE MÁXIMA SOBRE O PROMPT GERAL):\n")
-		triggerIndex.WriteString("ATENÇÃO CRÍTICA: Os procedimentos abaixo têm precedência absoluta sobre quaisquer instruções gerais ou seções '# Actions' do prompt. Sempre que a fala do cliente acionar o gatilho (Trigger) de um procedimento abaixo (por exemplo: falar em nome de terceiro/familiar como marido, esposa, mãe, filho ou dependente; pedir segunda via de boleto/fatura; ou informar CPF), você DEVE seguir estritamente as regras e perguntas obrigatórias desse procedimento na ordem exata:\n")
-		compactVoiceProcs.WriteString("\n\n## RESUMO DE PROCEDIMENTOS E COLETA DE DADOS:\nQuando o assunto do cliente corresponder a um procedimento abaixo, colete o dado inicial necessário (ex: CPF ou confirmação de titular/terceiro) e gere <|SpawnThinking|> imediatamente assim que o cliente informar os dados:\n")
+		triggerIndex.WriteString("## SKILLS / PROCEDIMENTOS DE ATENDIMENTO DO REASONER (PRIORIDADE MÁXIMA):\n")
+		triggerIndex.WriteString("ATENÇÃO CRÍTICA: Os procedimentos abaixo contêm o fluxo obrigatório e as ferramentas de cada assunto. Sempre que a solicitação do cliente corresponder ao gatilho (Trigger) de um procedimento abaixo (ex.: atendimento para terceiro/familiar como marido, esposa, mãe, filho ou dependente; segunda via de boleto/fatura; ou consulta por CPF), siga estritamente as etapas e regras desse procedimento na ordem exata:\n")
 		for _, p := range ps.entryProcedures {
+			skillSummaries = append(skillSummaries, voice.SkillSummary{
+				Name:        p.Name,
+				Description: p.Trigger,
+			})
 			procNamesList = append(procNamesList, fmt.Sprintf("%q (%s)", p.Name, p.Trigger))
-			triggerIndex.WriteString(fmt.Sprintf("\n### PROCEDIMENTO: %q\n- **Quando acionar (Trigger):** %s\n", p.Name, p.Trigger))
-			var bodyForVoice string
+			triggerIndex.WriteString(fmt.Sprintf("\n### SKILL / PROCEDIMENTO: %q\n- **Quando aplicar (Trigger):** %s\n", p.Name, p.Trigger))
 			if expanded, expErr := procExpander.ExpandProcedure(ctx, orgID, agentID, p, ps.procsMap); expErr == nil && strings.TrimSpace(expanded.ExpandedContent) != "" {
 				triggerIndex.WriteString(expanded.ExpandedContent)
 				triggerIndex.WriteString("\n")
-				bodyForVoice = strings.TrimSpace(expanded.ExpandedContent)
 				for tName, ok := range expanded.AllowedTools {
 					if ok {
 						ps.promptReferencedTools[tName] = true
@@ -372,19 +377,20 @@ func (rt *Runtime) prepareSession(
 			} else if strings.TrimSpace(p.Content) != "" {
 				triggerIndex.WriteString(p.Content)
 				triggerIndex.WriteString("\n")
-				bodyForVoice = strings.TrimSpace(p.Content)
 			}
-			bodyForVoice = truncateRunes(bodyForVoice, 450)
-			compactVoiceProcs.WriteString(fmt.Sprintf("- **%s** (Gatilho: %s): %s\n", p.Name, p.Trigger, bodyForVoice))
 		}
 		for _, p := range ps.activeProcedures {
 			if referencedAsSubProc[p.ID] {
-				triggerIndex.WriteString(fmt.Sprintf("\n### PROCEDIMENTO COMPLEMENTAR OBRIGATÓRIO: %q\n- **Quando acionar (Trigger):** %s\n", p.Name, p.Trigger))
+				if strings.TrimSpace(p.Trigger) != "" {
+					skillSummaries = append(skillSummaries, voice.SkillSummary{
+						Name:        p.Name,
+						Description: p.Trigger,
+					})
+				}
+				triggerIndex.WriteString(fmt.Sprintf("\n### SUB-SKILL / PROCEDIMENTO COMPLEMENTAR OBRIGATÓRIO: %q\n- **Quando aplicar (Trigger):** %s\n", p.Name, p.Trigger))
 				if expanded, expErr := procExpander.ExpandProcedure(ctx, orgID, agentID, p, ps.procsMap); expErr == nil && strings.TrimSpace(expanded.ExpandedContent) != "" {
 					triggerIndex.WriteString(expanded.ExpandedContent)
 					triggerIndex.WriteString("\n")
-					subBody := truncateRunes(strings.TrimSpace(expanded.ExpandedContent), 350)
-					compactVoiceProcs.WriteString(fmt.Sprintf("- **%s**: %s\n", p.Name, subBody))
 					for tName, ok := range expanded.AllowedTools {
 						if ok {
 							ps.promptReferencedTools[tName] = true
@@ -393,9 +399,10 @@ func (rt *Runtime) prepareSession(
 				}
 			}
 		}
-		// Posiciona os procedimentos no TOPO do systemPrompt para garantir precedência sem duplicar tokens
+		// Procedimentos completos ficam no systemPrompt (Gemini/Realtime) e no reasonerPrompt (Reasoner do GPT-Live),
+		// NUNCA no Speaker do GPT-Live (que recebe apenas skillSummaries de 1 linha estilo Vapi).
 		systemPrompt = triggerIndex.String() + "\n\n---\n\n" + systemPrompt + "\n\n[Lembrete: siga estritamente os procedimentos obrigatórios no topo deste prompt sempre que seus gatilhos forem acionados.]"
-		baseVoicePrompt += compactVoiceProcs.String()
+		reasonerPrompt = triggerIndex.String() + "\n\n---\n\n" + reasonerPrompt + "\n\n[Lembrete: siga estritamente os procedimentos obrigatórios no topo deste prompt sempre que seus gatilhos forem acionados.]"
 
 		ps.toolSpecs = append(ps.toolSpecs, voice.ToolSpec{
 			Name:        "ativar_procedure",
@@ -411,9 +418,11 @@ func (rt *Runtime) prepareSession(
 		&ps.toolSpecs, ps.registeredTools, ps.mcpSessions, ps.mcpBindings,
 	)
 	if len(mcpSummaryLines) > 0 {
-		systemPrompt += "\n\n## FERRAMENTAS DE INTEGRAÇÃO MCP CONECTADAS:\n" +
+		mcpBlock := "\n\n## FERRAMENTAS DE INTEGRAÇÃO MCP CONECTADAS:\n" +
 			"Quando um procedimento mencionar uma integração MCP pelo nome do servidor, chame diretamente a ferramenta específica listada abaixo correspondente à solicitação do usuário:\n" +
 			strings.Join(mcpSummaryLines, "\n")
+		systemPrompt += mcpBlock
+		reasonerPrompt += mcpBlock
 	}
 
 	ps.cfg = cfg
@@ -425,15 +434,21 @@ func (rt *Runtime) prepareSession(
 	ps.systemPrompt = systemPrompt
 
 	provSess, err := prov.Connect(ctx, voice.SessionConfig{
-		Model:           cfg.Model,
-		DelegationModel: cfg.SystemToolsConfig.DelegationModel,
-		Voice:           cfg.Voice,
-		Language:        cfg.Language,
-		SystemPrompt:    systemPrompt,
-		VoicePrompt:     baseVoicePrompt,
-		FirstMessage:    firstMessage,
-		ThinkingLevel:   "",
-		Tools:           ps.toolSpecs,
+		AgentName:        cfg.Name,
+		Model:            cfg.Model,
+		DelegationModel:  cfg.SystemToolsConfig.DelegationModel,
+		ReasoningEffort:  cfg.SystemToolsConfig.ReasoningEffort,
+		Voice:            cfg.Voice,
+		Language:         cfg.Language,
+		SystemPrompt:     systemPrompt,
+		VoicePrompt:      rawRenderedPrompt,
+		SpeakerPrompt:    speakerExplicitPrompt,
+		ReasonerPrompt:   reasonerPrompt,
+		PersonalityPacks: cfg.SystemToolsConfig.PersonalityPacks,
+		SkillSummaries:   skillSummaries,
+		FirstMessage:     firstMessage,
+		ThinkingLevel:    "",
+		Tools:            ps.toolSpecs,
 	})
 	if err != nil {
 		for _, ms := range ps.mcpSessions {
@@ -1640,13 +1655,27 @@ func (rt *Runtime) RunSessionWithOptions(
 							childPrompt += "\n\n## FERRAMENTAS DE INTEGRAÇÃO MCP CONECTADAS:\n" + strings.Join(childMCPLines, "\n")
 						}
 
+						var childSkillSummaries []voice.SkillSummary
+						for _, p := range newEntryProcedures {
+							childSkillSummaries = append(childSkillSummaries, voice.SkillSummary{
+								Name:        p.Name,
+								Description: p.Trigger,
+							})
+						}
 						childSess, err := childProv.Connect(sessionCtx, voice.SessionConfig{
-							Model:           targetCfg.Model,
-							DelegationModel: targetCfg.SystemToolsConfig.DelegationModel,
-							Voice:           targetCfg.Voice,
-							Language:        inheritedLang,
-							SystemPrompt:    childPrompt,
-							Tools:           childToolSpecs,
+							AgentName:        targetCfg.Name,
+							Model:            targetCfg.Model,
+							DelegationModel:  targetCfg.SystemToolsConfig.DelegationModel,
+							ReasoningEffort:  targetCfg.SystemToolsConfig.ReasoningEffort,
+							Voice:            targetCfg.Voice,
+							Language:         inheritedLang,
+							SystemPrompt:     childPrompt,
+							VoicePrompt:      variables.Render(targetCfg.SystemPrompt, allVars),
+							SpeakerPrompt:    variables.Render(targetCfg.SystemToolsConfig.SpeakerPrompt, allVars),
+							ReasonerPrompt:   childPrompt,
+							PersonalityPacks: targetCfg.SystemToolsConfig.PersonalityPacks,
+							SkillSummaries:   childSkillSummaries,
+							Tools:            childToolSpecs,
 						})
 						if err != nil {
 							for _, ms := range newMCPSessions {
@@ -2239,14 +2268,6 @@ type mcpToolBinding struct {
 	ParentTool     store.Tool
 	RemoteToolName string
 	Session        *tools.MCPSession
-}
-
-func truncateRunes(s string, maxRunes int) string {
-	r := []rune(s)
-	if len(r) <= maxRunes {
-		return s
-	}
-	return string(r[:maxRunes]) + "..."
 }
 
 func deriveWebhookToolParams(t store.Tool) []voice.Param {

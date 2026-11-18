@@ -301,6 +301,9 @@ export type SystemToolsConfig = {
   transfer_to_agent?: TransferToAgentToolConfig
   guardian_jev?: GuardianJevConfig
   delegation_model?: string
+  speaker_prompt?: string
+  personality_packs?: string[]
+  reasoning_effort?: string
 }
 
 export type AgentVersionSummary = {

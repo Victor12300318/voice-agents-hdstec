@@ -34,19 +34,20 @@ var models = []voice.Option{
 }
 
 var delegationModels = []voice.Option{
-	{ID: "gpt-6-luna", Label: "GPT-6 Luna", Description: "Recomendado pela OpenAI para GPT-Live — ultra-rápido e econômico para tools e procedimentos", Default: true},
-	{ID: "gpt-6.2-sol", Label: "GPT-6.2 Sol", Description: "Equilíbrio ideal entre inteligência e velocidade para agentes em escala"},
-	{ID: "gpt-6-sol", Label: "GPT-6 Sol", Description: "Especializado em fluxos agênticos complexos e múltiplas ferramentas"},
+	{ID: "gpt-5.6-terra", Label: "GPT-5.6 Terra (Padrão Reasoner)", Description: "Padrão estilo Vapi — equilíbrio ideal entre raciocínio, CPF/procedimentos e baixa latência", Default: true},
+	{ID: "gpt-6-luna", Label: "GPT-6 Luna", Description: "Ultra-rápido e econômico para alto volume"},
+	{ID: "gpt-5.6-sol", Label: "GPT-5.6 Sol", Description: "Máxima precisão na série 5.6 para procedimentos complexos"},
+	{ID: "gpt-5.6-luna", Label: "GPT-5.6 Luna", Description: "Baixa latência e custo reduzido (série 5.6)"},
+	{ID: "gpt-6.2-sol", Label: "GPT-6.2 Sol", Description: "Modelo avançado série 6.2 para agentes em escala"},
+	{ID: "gpt-6-sol", Label: "GPT-6 Sol", Description: "Especializado em fluxos agênticos e múltiplas ferramentas"},
 	{ID: "gpt-6.1-terra", Label: "GPT-6.1 Terra", Description: "Rápido e preciso para procedimentos estruturados"},
 	{ID: "gpt-6.2-astra", Label: "GPT-6.2 Astra", Description: "Máxima capacidade de raciocínio para regras críticas"},
-	{ID: "gpt-5.6-luna", Label: "GPT-5.6 Luna", Description: "Baixa latência otimizado para alto volume (série 5.6)"},
-	{ID: "gpt-5.6-terra", Label: "GPT-5.6 Terra", Description: "Equilibrado em inteligência e custo (série 5.6)"},
-	{ID: "gpt-5.4-mini", Label: "GPT-5.4 Mini", Description: "Modelo Mini ágil para subagentes e chamada de ferramentas"},
-	{ID: "gpt-5.4", Label: "GPT-5.4", Description: "Modelo completo série 5.4"},
+	{ID: "gpt-5.4-mini", Label: "GPT-5.4 Mini", Description: "Modelo Mini ágil para subagentes e ferramentas"},
 	{ID: "gpt-4.1-mini", Label: "GPT-4.1 Mini (Legado)", Description: "Compatibilidade com projetos legados"},
 }
 
 var fallbackDelegationChain = []string{
+	"gpt-5.6-terra",
 	"gpt-6-luna",
 	"gpt-5.6-luna",
 	"gpt-5.4-mini",
@@ -57,10 +58,24 @@ func resolveDelegationModel(m string) string {
 	m = strings.TrimSpace(m)
 	switch m {
 	case "", "gpt-4.1-nano", "o4-mini", "o3-mini", "o1-mini", "gpt-5-nano", "gpt-5.4-nano":
-		return "gpt-6-luna"
+		return "gpt-5.6-terra"
 	default:
 		return m
 	}
+}
+
+func resolveReasoningEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "none", "minimal", "low", "medium", "high", "xhigh":
+		return strings.ToLower(strings.TrimSpace(effort))
+	default:
+		return "low"
+	}
+}
+
+func supportsReasoningEffort(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(m, "gpt-5") || strings.HasPrefix(m, "gpt-6") || strings.HasPrefix(m, "o")
 }
 
 var voices = []voice.Option{
@@ -308,95 +323,223 @@ func truncateUTF8Runes(s string, maxRunes int) string {
 	return string(r[:maxRunes])
 }
 
-func buildLiveFrontendInstructions(cfg voice.SessionConfig, firstMsg string) string {
-	base := strings.TrimSpace(cfg.VoicePrompt)
-	if base == "" {
-		base = strings.TrimSpace(cfg.SystemPrompt)
+// extractSpeakerPersonaFromClassicPrompt extrai apenas as seções de identidade, voz e tom
+// quando o usuário ainda não preencheu um Speaker Prompt separado, garantindo que regras de
+// procedimentos, fluxos passo a passo e ferramentas fiquem 100% restritos ao Reasoner.
+func extractSpeakerPersonaFromClassicPrompt(classicPrompt, agentName string) string {
+	trimmed := strings.TrimSpace(classicPrompt)
+	if trimmed == "" {
+		if agentName != "" {
+			return fmt.Sprintf("Você é %s, assistente virtual de atendimento por voz. Fale com cordialidade, clareza e objetividade.", agentName)
+		}
+		return "Você é uma assistente virtual de atendimento por voz cordial, clara e prestativa."
 	}
-	base = truncateUTF8Runes(base, 10000)
+
+	lines := strings.Split(trimmed, "\n")
+	type mdSection struct {
+		heading string
+		body    strings.Builder
+	}
+	var sections []mdSection
+	var preamble strings.Builder
+	curIdx := -1
+
+	for _, line := range lines {
+		tLine := strings.TrimSpace(line)
+		if strings.HasPrefix(tLine, "#") {
+			h := strings.TrimLeft(tLine, "#")
+			h = strings.TrimSpace(h)
+			sections = append(sections, mdSection{heading: strings.ToLower(h)})
+			curIdx = len(sections) - 1
+			sections[curIdx].body.WriteString(line)
+			sections[curIdx].body.WriteString("\n")
+			continue
+		}
+		if curIdx >= 0 {
+			sections[curIdx].body.WriteString(line)
+			sections[curIdx].body.WriteString("\n")
+		} else {
+			preamble.WriteString(line)
+			preamble.WriteString("\n")
+		}
+	}
+
+	if len(sections) > 0 {
+		var kept strings.Builder
+		if p := strings.TrimSpace(preamble.String()); p != "" {
+			kept.WriteString(truncateUTF8Runes(p, 500))
+			kept.WriteString("\n\n")
+		}
+		for _, sec := range sections {
+			h := sec.heading
+			isSpeakerSection := strings.Contains(h, "personal") ||
+				strings.Contains(h, "role") ||
+				strings.Contains(h, "papel") ||
+				strings.Contains(h, "identidade") ||
+				strings.Contains(h, "persona") ||
+				strings.Contains(h, "tone") ||
+				strings.Contains(h, "tom") ||
+				strings.Contains(h, "style") ||
+				strings.Contains(h, "estilo") ||
+				strings.Contains(h, "environment") ||
+				strings.Contains(h, "ambiente") ||
+				strings.Contains(h, "pronunc") ||
+				strings.Contains(h, "pronúnc")
+			if isSpeakerSection {
+				kept.WriteString(strings.TrimSpace(sec.body.String()))
+				kept.WriteString("\n\n")
+			}
+		}
+		if res := strings.TrimSpace(kept.String()); res != "" {
+			return truncateUTF8Runes(res, 2500)
+		}
+	}
+
+	// Se for texto corrido sem seções markdown, mantém apenas o parágrafo inicial de apresentação/persona
+	firstPara := trimmed
+	if idx := strings.Index(firstPara, "\n\n"); idx > 0 {
+		firstPara = strings.TrimSpace(firstPara[:idx])
+	}
+	return truncateUTF8Runes(firstPara, 600)
+}
+
+func renderPersonalityPacks(packs []string) string {
+	var sb strings.Builder
+	for _, p := range packs {
+		switch strings.ToLower(strings.TrimSpace(p)) {
+		case "unhurried":
+			sb.WriteString("\nEstilo (Unhurried): Fale em ritmo calmo e claro, articulando bem datas, valores e nomes, deixando espaço natural entre ideias.")
+		case "eager-listener":
+			sb.WriteString("\nEstilo (Eager Listener): Em conversas abertas (exceto durante ditado de números/CPF), demonstre escuta atenta e dê espaço para o cliente concluir.")
+		case "bouncy":
+			sb.WriteString("\nEstilo (Bouncy): Use entonação acolhedora, expressiva e natural, adaptando-se ao humor do cliente sem exageros.")
+		case "idle-hummer":
+			sb.WriteString("\nEstilo (Idle Hummer): Mantenha presença suave durante esperas mais longas de ferramentas sem repetir frases de 'ainda verificando'.")
+		case "patient-numbers":
+			sb.WriteString("\nEstilo (Patient Numbers): Aguarde em silêncio absoluto toda a sequência de dígitos quando o cliente ditar CPF, protocolo, telefone ou data.")
+		}
+	}
+	return sb.String()
+}
+
+// buildLiveSpeakerInstructions constrói o prompt exclusivo do Speaker (modelo gpt-live-1),
+// seguindo o padrão Vapi: APENAS condução de fala, escuta, pausas e gatilhos de delegação,
+// SEM o conteúdo detalhado de procedimentos ou regras de ferramentas.
+func buildLiveSpeakerInstructions(cfg voice.SessionConfig, firstMsg string) string {
+	speakerBase := strings.TrimSpace(cfg.SpeakerPrompt)
+	if speakerBase == "" {
+		source := cfg.VoicePrompt
+		if strings.TrimSpace(source) == "" {
+			source = cfg.SystemPrompt
+		}
+		speakerBase = extractSpeakerPersonaFromClassicPrompt(source, cfg.AgentName)
+	} else {
+		speakerBase = truncateUTF8Runes(speakerBase, 4000)
+	}
 
 	var sb strings.Builder
-	if firstMsg != "" {
-		sb.WriteString(fmt.Sprintf(
-			" Saudação inicial obrigatória ao iniciar a chamada: diga exatamente %q uma única vez e aguarde o cliente responder.\n\n",
-			firstMsg,
-		))
+	sb.WriteString(speakerBase)
+
+	if packsText := renderPersonalityPacks(cfg.PersonalityPacks); packsText != "" {
+		sb.WriteString("\n")
+		sb.WriteString(packsText)
 	}
-	sb.WriteString(base)
 
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(cfg.Language)), "pt") || cfg.Language == "" {
-		sb.WriteString("\n\nATENÇÃO DE ESCUTA E TRANSCRIÇÃO (PT-BR): O cliente fala em Português do Brasil (pt-BR) por telefone. Interprete respostas curtas e números ditados em português do Brasil ('meia' = 6, 'zero' = 0, 'Sim', 'Não', 'Pode sim', CPF em blocos). Nunca mude para espanhol ou inglês.")
+		sb.WriteString(`
+
+Regras de fala e condução (Português do Brasil):
+- Fale sempre em Português do Brasil (pt-BR), de forma cordial, natural e objetiva, em uma ou duas frases curtas por turno.
+- Faça APENAS UMA pergunta por vez. Use os dados que o cliente já informou (como o nome dele) e nunca peça novamente o que já foi dito.
+- Tags entre colchetes como [super fast] são marcações internas e jamais devem ser lidas em voz alta.
+- PACIÊNCIA ABSOLUTA EM CPF E NÚMEROS: Clientes ditam CPF (11 dígitos), telefones e datas em blocos com pausas no meio (ex.: "176... 110... 240... 00"). Enquanto o cliente estiver ditando números, permaneça em SILÊNCIO TOTAL — não diga "uhum", "certo", "pode continuar" nem dê exemplos por cima da fala dele. Só responda e delegue depois que ele terminar de ditar os números e fizer uma pausa clara.
+- SEPARE FALAR DE FAZER: Nunca diga "vou verificar" quando estiver apenas pedindo um dado que falta (como pedir o CPF). Se faltar o CPF, apenas peça o CPF de forma direta e aguarde em silêncio.`)
 	}
 
-	// Estrutura oficial do guia Prompting GPT-Live (developers.openai.com/api/docs/guides/live-prompting):
-	// Para o gpt-live-1, a delegação DEVE ser solicitada via "Generate <|SpawnThinking|>".
-	sb.WriteString("\n\nBackchannel policy: Use brief, natural listening cues sparingly without competing with the caller or interrupting numbers/CPF dictation.\n")
-	sb.WriteString("\nInterruption policy: Stop speaking when the user interrupts and listen until they finish.\n")
+	if firstMsg != "" {
+		sb.WriteString(fmt.Sprintf("\n- Saudação inicial na abertura da chamada: diga apenas %q uma única vez e aguarde o cliente responder.", firstMsg))
+	}
 
-	if len(cfg.Tools) > 0 {
+	sb.WriteString("\n\nBackchannel policy: Use light backchannels sparingly. Never produce any backchannel or interjection while the caller is dictating digits, a CPF, a name spelling, or dates.\n")
+	sb.WriteString("\nInterruption policy: Stop speaking immediately when the caller interrupts. Listen until they finish.\n")
+
+	hasRealTools := false
+	for _, t := range cfg.Tools {
+		if t.Name != "ativar_procedure" {
+			hasRealTools = true
+			break
+		}
+	}
+
+	if hasRealTools || len(cfg.SkillSummaries) > 0 {
 		sb.WriteString("\nDelegation policy:\nBackend tools:\n")
+		for _, sk := range cfg.SkillSummaries {
+			desc := truncateUTF8Runes(strings.TrimSpace(sk.Description), 200)
+			sb.WriteString(fmt.Sprintf("- Procedure [%s]: %s\n", sk.Name, desc))
+		}
 		for _, t := range cfg.Tools {
 			if t.Name == "ativar_procedure" {
 				continue
 			}
-			desc := truncateUTF8Runes(strings.TrimSpace(t.Description), 220)
-			sb.WriteString(fmt.Sprintf("- %s: %s\n", t.Name, desc))
+			desc := truncateUTF8Runes(strings.TrimSpace(t.Description), 180)
+			sb.WriteString(fmt.Sprintf("- Tool [%s]: %s\n", t.Name, desc))
 		}
 		sb.WriteString(`
 Generate <|SpawnThinking|> when:
-- The user provides a CPF, document number, birth date, verification answer, or any data needed to look up or validate their account/registration/boleto.
-- The user asks for a second copy of a bill/boleto, invoice details, registration lookup, transfer, or any action handled by Backend tools.
-- A correction or additional detail changes a lookup or task already requested.
-- Whenever you tell the user you will check, verify, consult, transfer, or end the call ("vou verificar", "só um instante", "já consulto"), you MUST generate <|SpawnThinking|> immediately.
+- The caller states what they need (such as second copy of a bill/boleto, financial info, registration check, or any listed Procedure) so the reasoner can guide the exact next step.
+- The reasoner asked for a detail (such as CPF, birth date, or holder/dependent confirmation) and the caller has finished providing it.
+- The caller corrects a number, changes their request, asks to transfer to a human/agent, or says goodbye / asks to end the call.
 
 Do not generate <|SpawnThinking|> when:
-- Delivering the opening greeting before the user has spoken.
-- Asking the user for a missing piece of information (for example, asking them to say their CPF before they have provided it).
+- Delivering the initial greeting at the start of the call before the caller speaks.
+- The caller only said "só um momento / espera um instante" while looking for a document — simply say "Claro, fico aguardando" and wait quietly.
+- The caller is still mid-dictation of a CPF or number sequence.
 
-Generate <|SpawnThinking|> before giving an answer that depends on backend work.
-Do not guess the result while waiting.`)
+While work is running:
+- Acknowledge the wait at most once briefly (e.g., "Só um instante enquanto verifico.") and give the caller quiet room. Do NOT repeat "vou verificar" twice and do NOT invent results while waiting.
+
+Results:
+- Relay the reasoner's exact question or verified facts naturally in one or two short sentences. Never claim a lookup, boleto send, or action succeeded unless the reasoner confirmed it.`)
 	}
 
 	return sb.String()
 }
 
-func buildLiveBackendInstructions(cfg voice.SessionConfig) string {
+// buildLiveReasonerInstructions constrói o prompt exclusivo do Reasoner (delegation.responses),
+// contendo todas as instruções de tarefa, procedimentos completos (Skills) e regras de ferramentas.
+func buildLiveReasonerInstructions(cfg voice.SessionConfig) string {
+	reasonerBody := strings.TrimSpace(cfg.ReasonerPrompt)
+	if reasonerBody == "" {
+		reasonerBody = strings.TrimSpace(cfg.SystemPrompt)
+	}
+
 	var sb strings.Builder
-	sb.WriteString(`## Voice conversation context
-You are the reasoning and tool-execution backend for a live telephone voice assistant in Brazilian Portuguese (pt-BR).
-- Spoken transcripts arrive in fragments and may contain pauses, punctuation ("..."), or Brazilian Portuguese number words: "meia" = 6, "zero" = 0, "um/uma" = 1, "dois/duas" = 2, "três" = 3, "quatro" = 4, "cinco" = 5, "sete" = 7, "oito" = 8, "nove" = 9, "dez" = 10, "onze" = 11, "vinte" = 20, "trinta" = 30, "quarenta" = 40, "cinquenta" = 50, "sessenta" = 60, "setenta" = 70, "oitenta" = 80, "noventa" = 90, "cem" = 100 (for example: "1 7 meia ... 11 ... 0 2 ... 40 00" = "17611024000").
-- Always reconstruct and strip spaces, dots, and hyphens from spoken CPF digits before calling any lookup tool. If the reconstructed CPF has 11 digits, call the lookup tool IMMEDIATELY in this response!
-- All agent procedures are already expanded below: call the required business/webhook/MCP tool DIRECTLY (do NOT waste a turn calling ativar_procedure first).
-- Return concise, factual results and the exact next step or question for the voice assistant to speak naturally to the caller.
+	sb.WriteString(`## Papel do Reasoner (Backend de Raciocínio, Procedimentos e Ferramentas)
+Você é o Reasoner por trás da assistente de voz em uma ligação telefônica em Português do Brasil (pt-BR). Você NÃO fala diretamente com o cliente: o resultado que você retornar será falado pelo Speaker.
+
+Regras essenciais do Reasoner:
+1. Trabalhe sempre a partir da solicitação mais recente na transcrição da conversa. Transcrições de voz chegam fragmentadas, com vírgulas, pausas ("...") ou números por extenso em português ("meia" = 6, "zero" = 0, "um/uma" = 1, "dois/duas" = 2, "três" = 3, "quatro" = 4, "cinco" = 5, "sete" = 7, "oito" = 8, "nove" = 9, "dez" = 10, "onze" = 11, "vinte" = 20, "trinta" = 30, "quarenta" = 40, "cinquenta" = 50).
+2. Reconstrução de CPF: junte os dígitos ditados pelo cliente (inclusive se vierem divididos em turnos seguidos como "176" e depois "11, 02, 40, 00" -> "17611024000"), removendo pontos, espaços, vírgulas e traços. Assim que houver 11 dígitos, CHAME IMEDIATAMENTE a ferramenta de consulta correspondente neste mesmo turno!
+3. Se um dado obrigatório para a ferramenta ainda não foi informado (ex.: o cliente pediu 2ª via de boleto mas ainda não disse o CPF), retorne APENAS uma instrução curta e direta dizendo qual pergunta o Speaker deve fazer agora (ex.: "Peça ao cliente os 11 números do CPF do beneficiário."), sem dizer "vou verificar".
+4. Se o CPF transcrito tiver menos de 11 dígitos (ex.: cortou um dígito na linha), peça de forma simples para o cliente repetir pausadamente os 11 números do CPF, sem dar exemplos longos.
+5. Retorne SEMPRE fatos curtos, diretos e prontos para fala natural — SEM Markdown, SEM listas com asteriscos, SEM blocos técnicos. Nunca confirme uma ação ou envio que a ferramenta não tenha confirmado com sucesso.
 
 `)
-	sb.WriteString(cfg.SystemPrompt)
+	sb.WriteString(reasonerBody)
 	return sb.String()
 }
 
-func promisedBackendLookup(spoken string) bool {
-	s := strings.ToLower(strings.TrimSpace(spoken))
-	if s == "" {
-		return false
-	}
-	for _, kw := range []string{
-		"vou verificar",
-		"já vou verificar",
-		"vou consultar",
-		"já vou consultar",
-		"vou checar",
-		"vou buscar",
-		"já te retorno",
-		"só um instante",
-		"so um instante",
-		"aguarde um instante",
-		"um momento enquanto",
-	} {
-		if strings.Contains(s, kw) {
-			return true
+func openAILiveTools(tools []voice.ToolSpec) []map[string]any {
+	filtered := make([]voice.ToolSpec, 0, len(tools))
+	for _, t := range tools {
+		// No GPT-Live todos os procedimentos já estão carregados no Reasoner; remover ativar_procedure
+		// evita gastar um round-trip extra antes de chamar a ferramenta real (ex: consultar_beneficiario).
+		if t.Name == "ativar_procedure" {
+			continue
 		}
+		filtered = append(filtered, t)
 	}
-	return false
+	return openAITools(filtered)
 }
 
 // connectLive estabelece uma sessão WebSocket no protocolo GPT-Live 1 (wss://api.openai.com/v1/live/sessions).
@@ -413,6 +556,8 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 
 	firstMsg := strings.TrimSpace(cfg.FirstMessage)
 	delegationModel := resolveDelegationModel(cfg.DelegationModel)
+	reasoningEffort := resolveReasoningEffort(cfg.ReasoningEffort)
+	liveTools := openAILiveTools(cfg.Tools)
 
 	sess := &openAILiveSession{
 		conn:                  conn,
@@ -420,19 +565,32 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 		startedCh:             make(chan struct{}),
 		stopCh:                make(chan struct{}),
 		startedTime:           time.Now(),
-		hasTools:              len(cfg.Tools) > 0,
+		hasTools:              len(liveTools) > 0,
 		activeDelegationModel: delegationModel,
 	}
 	// Começa zerado para o relógio de áudio disparar imediatamente na primeira fala antes do microfone conectar
 	sess.lastAudioAt.Store(0)
 
-	livePrompt := buildLiveFrontendInstructions(cfg, firstMsg)
-	backendPrompt := buildLiveBackendInstructions(cfg)
+	speakerPrompt := buildLiveSpeakerInstructions(cfg, firstMsg)
+	reasonerPrompt := buildLiveReasonerInstructions(cfg)
 	voiceID := resolveLiveVoice(cfg.Voice)
+
+	responsesCfg := map[string]any{
+		"model":               delegationModel,
+		"instructions":        reasonerPrompt,
+		"tools":               liveTools,
+		"tool_choice":         "auto",
+		"parallel_tool_calls": false,
+	}
+	if supportsReasoningEffort(delegationModel) {
+		responsesCfg["reasoning"] = map[string]any{
+			"effort": reasoningEffort,
+		}
+	}
 
 	sessionObj := map[string]any{
 		"model":        "gpt-live-1",
-		"instructions": livePrompt,
+		"instructions": speakerPrompt,
 		"audio": map[string]any{
 			"format": map[string]any{
 				"type": "audio/pcm",
@@ -443,14 +601,9 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 			},
 		},
 		"delegation": map[string]any{
-			"type": "responses",
-			"responses": map[string]any{
-				"model":               delegationModel,
-				"instructions":        backendPrompt,
-				"tools":               openAITools(cfg.Tools),
-				"tool_choice":         "auto",
-				"parallel_tool_calls": false,
-			},
+			"type":                     "responses",
+			"acknowledgement_delay_ms": 600,
+			"responses":                responsesCfg,
 		},
 	}
 
@@ -558,10 +711,10 @@ type openAILiveSession struct {
 	lastAudioAt              atomic.Int64
 	nextKeepaliveAt          atomic.Int64
 	lastOutputAt             atomic.Int64
+	lastInterruptAt          atomic.Int64
 	lastDelegationAt         atomic.Int64
 	agentSpeaking            atomic.Bool
 	silentTailSent           atomic.Int32
-	turnTranscript           strings.Builder
 	turnTimer                *time.Timer
 	speechTimer              *time.Timer
 	firstMsgRetryTimer       *time.Timer
@@ -830,19 +983,8 @@ func (s *openAILiveSession) dispatch(data []byte) {
 					s.agentSpeaking.Store(false)
 					s.mu.Lock()
 					cl := s.closed
-					spokenTurn := s.turnTranscript.String()
-					s.turnTranscript.Reset()
 					s.mu.Unlock()
 					if !cl {
-						// Safety-net: se o GPT-Live disse ao cliente "vou verificar / só um instante" mas esqueceu
-						// de emitir <|SpawnThinking|> (nenhuma delegação nos últimos 4s), dispara response.create no backend!
-						if s.hasTools && promisedBackendLookup(spokenTurn) && time.Since(time.UnixMilli(s.lastDelegationAt.Load())) > 4*time.Second {
-							s.lastDelegationAt.Store(time.Now().UnixMilli())
-							_ = s.writeJSON(map[string]any{
-								"type":     "response.create",
-								"event_id": s.nextEventID("auto_del"),
-							})
-						}
 						s.events <- voice.Event{Type: voice.EventTurnComplete}
 					}
 				})
@@ -855,9 +997,6 @@ func (s *openAILiveSession) dispatch(data []byte) {
 			Delta string `json:"delta"`
 		}
 		if json.Unmarshal(data, &ev) == nil && ev.Delta != "" {
-			s.mu.Lock()
-			s.turnTranscript.WriteString(ev.Delta)
-			s.mu.Unlock()
 			s.events <- voice.Event{Type: voice.EventAgentTranscript, Text: ev.Delta}
 		}
 
@@ -866,8 +1005,10 @@ func (s *openAILiveSession) dispatch(data []byte) {
 			Delta string `json:"delta"`
 		}
 		if json.Unmarshal(data, &ev) == nil && ev.Delta != "" {
-			// Só emite EventInterrupted uma única vez por turno se o agente estiver realmente falando no momento
-			if time.Since(time.UnixMilli(s.lastOutputAt.Load())) < 350*time.Millisecond && s.agentSpeaking.CompareAndSwap(true, false) {
+			// Só emite EventInterrupted com debounce de 800ms se o agente estiver realmente falando no momento
+			nowMS := time.Now().UnixMilli()
+			if nowMS-s.lastOutputAt.Load() < 350 && nowMS-s.lastInterruptAt.Load() > 800 && s.agentSpeaking.CompareAndSwap(true, false) {
+				s.lastInterruptAt.Store(nowMS)
 				s.events <- voice.Event{Type: voice.EventInterrupted}
 			}
 			s.events <- voice.Event{Type: voice.EventCallerTranscript, Text: ev.Delta}
@@ -875,7 +1016,7 @@ func (s *openAILiveSession) dispatch(data []byte) {
 			if s.speechTimer != nil {
 				s.speechTimer.Stop()
 			}
-			s.speechTimer = time.AfterFunc(450*time.Millisecond, func() {
+			s.speechTimer = time.AfterFunc(550*time.Millisecond, func() {
 				s.mu.Lock()
 				cl := s.closed
 				s.mu.Unlock()
@@ -899,6 +1040,22 @@ func (s *openAILiveSession) dispatch(data []byte) {
 			} `json:"error"`
 		}
 		if json.Unmarshal(data, &errEv) == nil {
+			// Se o modelo selecionado não suportar reasoning.effort, remove reasoning mantendo o modelo
+			if strings.Contains(errEv.Error.Param, "reasoning") {
+				_ = s.writeJSON(map[string]any{
+					"type":     "session.update",
+					"event_id": s.nextEventID("del_noreason"),
+					"session": map[string]any{
+						"delegation": map[string]any{
+							"type": "responses",
+							"responses": map[string]any{
+								"reasoning": nil,
+							},
+						},
+					},
+				})
+				return
+			}
 			// Auto-recuperação caso o modelo configurado em delegation.responses não esteja habilitado na conta/tier
 			if errEv.Error.Code == "responses_validation_failed" || strings.HasPrefix(errEv.Error.Param, "session.delegation.responses") {
 				s.mu.Lock()
@@ -914,15 +1071,19 @@ func (s *openAILiveSession) dispatch(data []byte) {
 				}
 				s.mu.Unlock()
 				if nextModel != "" {
+					respPatch := map[string]any{
+						"model": nextModel,
+					}
+					if !supportsReasoningEffort(nextModel) {
+						respPatch["reasoning"] = nil
+					}
 					_ = s.writeJSON(map[string]any{
 						"type":     "session.update",
 						"event_id": s.nextEventID("del_fallback"),
 						"session": map[string]any{
 							"delegation": map[string]any{
-								"type": "responses",
-								"responses": map[string]any{
-									"model": nextModel,
-								},
+								"type":      "responses",
+								"responses": respPatch,
 							},
 						},
 					})

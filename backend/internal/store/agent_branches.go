@@ -722,6 +722,15 @@ func (s *Store) RouteVersionForConversation(ctx context.Context, orgID string, a
 						if ver.Snapshot.SystemToolsConfig.DelegationModel == "" && draftCfg.SystemToolsConfig.DelegationModel != "" {
 							ver.Snapshot.SystemToolsConfig.DelegationModel = draftCfg.SystemToolsConfig.DelegationModel
 						}
+						if ver.Snapshot.SystemToolsConfig.SpeakerPrompt == "" && draftCfg.SystemToolsConfig.SpeakerPrompt != "" {
+							ver.Snapshot.SystemToolsConfig.SpeakerPrompt = draftCfg.SystemToolsConfig.SpeakerPrompt
+						}
+						if len(ver.Snapshot.SystemToolsConfig.PersonalityPacks) == 0 && len(draftCfg.SystemToolsConfig.PersonalityPacks) > 0 {
+							ver.Snapshot.SystemToolsConfig.PersonalityPacks = draftCfg.SystemToolsConfig.PersonalityPacks
+						}
+						if ver.Snapshot.SystemToolsConfig.ReasoningEffort == "" && draftCfg.SystemToolsConfig.ReasoningEffort != "" {
+							ver.Snapshot.SystemToolsConfig.ReasoningEffort = draftCfg.SystemToolsConfig.ReasoningEffort
+						}
 					}
 					bID := chosen.ID
 					return ver.Snapshot, &ver.ID, &bID, nil
@@ -741,6 +750,15 @@ func (s *Store) RouteVersionForConversation(ctx context.Context, orgID string, a
 			}
 			if v.Snapshot.SystemToolsConfig.DelegationModel == "" && draftCfg.SystemToolsConfig.DelegationModel != "" {
 				v.Snapshot.SystemToolsConfig.DelegationModel = draftCfg.SystemToolsConfig.DelegationModel
+			}
+			if v.Snapshot.SystemToolsConfig.SpeakerPrompt == "" && draftCfg.SystemToolsConfig.SpeakerPrompt != "" {
+				v.Snapshot.SystemToolsConfig.SpeakerPrompt = draftCfg.SystemToolsConfig.SpeakerPrompt
+			}
+			if len(v.Snapshot.SystemToolsConfig.PersonalityPacks) == 0 && len(draftCfg.SystemToolsConfig.PersonalityPacks) > 0 {
+				v.Snapshot.SystemToolsConfig.PersonalityPacks = draftCfg.SystemToolsConfig.PersonalityPacks
+			}
+			if v.Snapshot.SystemToolsConfig.ReasoningEffort == "" && draftCfg.SystemToolsConfig.ReasoningEffort != "" {
+				v.Snapshot.SystemToolsConfig.ReasoningEffort = draftCfg.SystemToolsConfig.ReasoningEffort
 			}
 		}
 		return v.Snapshot, &v.ID, v.BranchID, nil
