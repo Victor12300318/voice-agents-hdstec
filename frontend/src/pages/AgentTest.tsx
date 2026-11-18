@@ -165,6 +165,7 @@ export default function AgentTest() {
             prewarmedRecorder.stop()
             return null
           }
+          prewarmedRecorder.setMuted(antiEcho && player.isPlaying() ? true : isMuted)
           recorderRef.current = prewarmedRecorder
           setMicStream(prewarmedRecorder.getStream())
           return null
@@ -176,14 +177,22 @@ export default function AgentTest() {
       }
 
       ws.onmessage = async (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          setStatus('speaking')
+          setStatusDetail('Agente falando...')
+          player.playChunk(event.data)
+          return
+        }
         if (typeof event.data === 'string') {
           try {
             const msg = JSON.parse(event.data)
             switch (msg.type) {
               case 'ready':
                 wsReady = true
-                setStatus('listening')
-                setStatusDetail('Pronto! Fale com o agente a qualquer momento.')
+                if (!player.isPlaying()) {
+                  setStatus('listening')
+                  setStatusDetail('Pronto! Fale com o agente a qualquer momento.')
+                }
                 if (msg.variables) {
                   setResolvedVars(msg.variables)
                 }
@@ -194,13 +203,14 @@ export default function AgentTest() {
                   if (micErr) {
                     throw micErr
                   }
-                  if (!recorderRef.current) {
+                  if (!recorderRef.current && wsRef.current === ws) {
                     const recorder = new AudioRecorder((pcm) => {
                       if (ws.readyState === WebSocket.OPEN) {
                         ws.send(pcm)
                       }
                     })
                     await recorder.start(msg.input_sample_rate || 16000)
+                    recorder.setMuted(antiEcho && player.isPlaying() ? true : isMuted)
                     recorderRef.current = recorder
                     setMicStream(recorder.getStream())
                   }
@@ -266,11 +276,6 @@ export default function AgentTest() {
           } catch (e) {
             console.error('Erro ao processar JSON do WS:', e)
           }
-        } else if (event.data instanceof ArrayBuffer) {
-          // Áudio recebido do agente (PCM16 24kHz)
-          setStatus('speaking')
-          setStatusDetail('Agente falando...')
-          player.playChunk(event.data)
         }
       }
 

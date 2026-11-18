@@ -27,6 +27,12 @@ type initiationPrefetchEntry struct {
 	err  error
 }
 
+type prewarmCallEntry struct {
+	done chan struct{}
+	ps   *preparedSession
+	err  error
+}
+
 type Runtime struct {
 	Store        *store.Store
 	Voices       *voice.Registry
@@ -37,6 +43,88 @@ type Runtime struct {
 	Log          *slog.Logger
 	prefetchMu   sync.Mutex
 	prefetchByID map[string]*initiationPrefetchEntry
+	prewarmByID  map[string]*prewarmCallEntry
+}
+
+// PrewarmCall prepara antecipadamente o Initiation Webhook, prompt, procedures, MCP tools e
+// a conexão WebSocket com o Voice Provider (incluindo disparo da FirstMessage) já durante o
+// webhook HTTP inicial da Twilio/Jambonz, eliminando o tempo morto quando o Media Stream conecta.
+func (rt *Runtime) PrewarmCall(
+	callSid, orgID, agentID, callerID, calledNumber string,
+	cfg store.AgentConfig,
+	prov voice.Provider,
+) {
+	if rt == nil || callSid == "" || prov == nil {
+		return
+	}
+	rt.prefetchMu.Lock()
+	if rt.prewarmByID == nil {
+		rt.prewarmByID = make(map[string]*prewarmCallEntry)
+	}
+	if _, exists := rt.prewarmByID[callSid]; exists {
+		rt.prefetchMu.Unlock()
+		return
+	}
+	entry := &prewarmCallEntry{done: make(chan struct{})}
+	rt.prewarmByID[callSid] = entry
+	rt.prefetchMu.Unlock()
+
+	go func() {
+		lifeCtx, cancelLife := context.WithCancel(context.Background())
+		setupTimer := time.AfterFunc(15*time.Second, cancelLife)
+		ps, err := rt.prepareSession(lifeCtx, time.Now(), orgID, agentID, callSid, callerID, calledNumber, callSid, cfg, prov)
+		setupTimer.Stop()
+		if err != nil {
+			cancelLife()
+		} else if ps != nil {
+			ps.cancelLifetime = cancelLife
+		}
+
+		entry.ps = ps
+		entry.err = err
+		close(entry.done)
+
+		// Se o Media Stream WebSocket não consumir em até 20s (ex: desistência no toque), fecha recursos sem vazar
+		time.AfterFunc(20*time.Second, func() {
+			var orphan *preparedSession
+			rt.prefetchMu.Lock()
+			if cur, ok := rt.prewarmByID[callSid]; ok && cur == entry {
+				delete(rt.prewarmByID, callSid)
+				orphan = cur.ps
+			}
+			rt.prefetchMu.Unlock()
+			if orphan != nil {
+				orphan.cleanup()
+			}
+		})
+	}()
+}
+
+func (rt *Runtime) consumePrewarmedCall(ctx context.Context, callSid string) (*preparedSession, bool, error) {
+	if rt == nil || callSid == "" {
+		return nil, false, nil
+	}
+	rt.prefetchMu.Lock()
+	entry, ok := rt.prewarmByID[callSid]
+	if ok {
+		delete(rt.prewarmByID, callSid)
+	}
+	rt.prefetchMu.Unlock()
+	if !ok {
+		return nil, false, nil
+	}
+	select {
+	case <-entry.done:
+		return entry.ps, true, entry.err
+	case <-ctx.Done():
+		go func() {
+			<-entry.done
+			if entry.ps != nil {
+				entry.ps.cleanup()
+			}
+		}()
+		return nil, true, ctx.Err()
+	}
 }
 
 // PrefetchInitiation dispara em paralelo a busca do Initiation Webhook durante o ringing/conexão da Twilio
@@ -46,7 +134,7 @@ func (rt *Runtime) PrefetchInitiation(
 	callSid, agentID, callerID, calledNumber string,
 	cfg store.AgentConfig,
 ) {
-	if callSid == "" || cfg.InitiationWebhookURL == "" {
+	if rt == nil || callSid == "" || cfg.InitiationWebhookURL == "" {
 		return
 	}
 	rt.prefetchMu.Lock()

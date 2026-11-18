@@ -94,3 +94,33 @@ func TestOpenAIDelegationModelsCatalog(t *testing.T) {
 		t.Fatal("esperava um modelo de delegação padrão no catálogo OpenAI")
 	}
 }
+
+func TestOpenAILiveDispatchMarksFirstOutputAudio(t *testing.T) {
+	sess := &openAILiveSession{
+		events:             make(chan voice.Event, 16),
+		firstMessagePrimed: true,
+	}
+	// Silêncio puro antes da fala não deve marcar firstOutputAudioReceived
+	silentMsg, _ := json.Marshal(map[string]string{
+		"type":  "session.output_audio.delta",
+		"delta": base64.StdEncoding.EncodeToString(make([]byte, 320)),
+	})
+	sess.dispatch(silentMsg)
+	if sess.firstOutputAudioReceived.Load() {
+		t.Fatal("silêncio puro não deveria marcar firstOutputAudioReceived")
+	}
+
+	// Áudio audível deve marcar firstOutputAudioReceived e emitir EventAudio
+	audiblePCM := []byte{0x00, 0x02, 0x00, 0x02}
+	audibleMsg, _ := json.Marshal(map[string]string{
+		"type":  "session.output_audio.delta",
+		"delta": base64.StdEncoding.EncodeToString(audiblePCM),
+	})
+	sess.dispatch(audibleMsg)
+	if !sess.firstOutputAudioReceived.Load() {
+		t.Fatal("esperava firstOutputAudioReceived=true após áudio audível")
+	}
+	if sess.turnTimer != nil {
+		sess.turnTimer.Stop()
+	}
+}

@@ -48,6 +48,394 @@ func (rt *Runtime) runSession(
 	rt.RunSessionWithOptions(ctx, opts, cfg, prov)
 }
 
+type deferredConvEvent struct {
+	Type    string
+	Payload any
+}
+
+type preparedSession struct {
+	cfg                   store.AgentConfig
+	prov                  voice.Provider
+	cat                   voice.Catalog
+	provSess              voice.Session
+	cancelLifetime        context.CancelFunc
+	allVars               map[string]string
+	firstMessage          string
+	systemPrompt          string
+	procsMap              map[string]store.ProcedureSnapshot
+	activeProcedures      []store.ProcedureSnapshot
+	entryProcedures       []store.ProcedureSnapshot
+	promptReferencedTools map[string]bool
+	toolSpecs             []voice.ToolSpec
+	registeredTools       map[string]store.Tool
+	mcpSessions           map[string]*tools.MCPSession
+	mcpBindings           map[string]mcpToolBinding
+	deferredEvents        []deferredConvEvent
+}
+
+func (ps *preparedSession) cleanup() {
+	if ps == nil {
+		return
+	}
+	if ps.provSess != nil {
+		_ = ps.provSess.Close()
+	}
+	for _, ms := range ps.mcpSessions {
+		if ms != nil {
+			ms.Close()
+		}
+	}
+	if ps.cancelLifetime != nil {
+		ps.cancelLifetime()
+	}
+}
+
+func (rt *Runtime) prepareSession(
+	ctx context.Context,
+	startedAt time.Time,
+	orgID, agentID, convIDForVars, callerID, toNumber, callSid string,
+	cfg store.AgentConfig,
+	prov voice.Provider,
+) (*preparedSession, error) {
+	ps := &preparedSession{
+		allVars:               map[string]string{},
+		procsMap:              make(map[string]store.ProcedureSnapshot),
+		promptReferencedTools: make(map[string]bool),
+		registeredTools:       make(map[string]store.Tool),
+		mcpSessions:           make(map[string]*tools.MCPSession),
+		mcpBindings:           make(map[string]mcpToolBinding),
+	}
+
+	addDeferred := func(evType string, payload any) {
+		ps.deferredEvents = append(ps.deferredEvents, deferredConvEvent{Type: evType, Payload: payload})
+	}
+
+	for _, decl := range cfg.Variables {
+		ps.allVars[decl.Name] = ""
+	}
+
+	// Dynamic variables + Overrides via Initiation Webhook (padrão ElevenLabs Twilio Personalization)
+	if cfg.InitiationWebhookURL != "" {
+		var initRes variables.InitiationResult
+		var initErr error
+
+		if prefRes, ok, prefErr := rt.consumePrefetchedInitiation(ctx, callSid); ok {
+			initRes, initErr = prefRes, prefErr
+		} else {
+			timeout := time.Duration(cfg.InitiationWebhookTimeout) * time.Millisecond
+			if timeout <= 0 {
+				timeout = 3 * time.Second
+			}
+			initRes, initErr = variables.FetchInitiationData(
+				ctx,
+				rt.HTTPClient,
+				cfg.InitiationWebhookURL,
+				timeout,
+				variables.InitiationRequest{
+					CallerID:       callerID,
+					AgentID:        agentID,
+					CalledNumber:   toNumber,
+					CallSid:        callSid,
+					ConversationID: convIDForVars,
+					Caller:         callerID,
+					Metadata:       map[string]any{},
+				},
+				cfg.Variables,
+			)
+		}
+
+		if initErr != nil {
+			if rt.Log != nil {
+				rt.Log.Warn("initiation_webhook_failed", "conversation_id", convIDForVars, "caller_id", callerID, "error", initErr)
+			}
+			addDeferred("initiation_webhook_warning", map[string]any{
+				"phase": "initiation",
+				"error": initErr.Error(),
+			})
+		} else {
+			for k, v := range initRes.DynamicVariables {
+				ps.allVars[k] = v
+			}
+			if len(initRes.MissingVariables) > 0 && rt.Log != nil {
+				rt.Log.Warn("initiation_webhook_missing_vars", "conversation_id", convIDForVars, "missing", initRes.MissingVariables)
+			}
+			// Aplica conversation_config_override se retornado pelo webhook (padrão ElevenLabs)
+			if ov := initRes.ConversationConfigOverride; ov != nil {
+				if ov.Agent != nil {
+					if ov.Agent.Prompt != nil {
+						if strings.TrimSpace(ov.Agent.Prompt.Prompt) != "" {
+							cfg.SystemPrompt = ov.Agent.Prompt.Prompt
+						}
+						if strings.TrimSpace(ov.Agent.Prompt.LLM) != "" {
+							cfg.Model = ov.Agent.Prompt.LLM
+						}
+					}
+					if strings.TrimSpace(ov.Agent.FirstMessage) != "" {
+						cfg.FirstMessage = ov.Agent.FirstMessage
+					}
+					if strings.TrimSpace(ov.Agent.Language) != "" {
+						cfg.Language = ov.Agent.Language
+					}
+				}
+				if ov.TTS != nil && strings.TrimSpace(ov.TTS.VoiceID) != "" {
+					cfg.Voice = ov.TTS.VoiceID
+				}
+			}
+			addDeferred("initiation_webhook_loaded", map[string]any{
+				"dynamic_variables": initRes.DynamicVariables,
+				"has_overrides":     initRes.ConversationConfigOverride != nil,
+			})
+		}
+	}
+
+	if prov == nil && rt.Voices != nil {
+		if resolvedProv, pErr := rt.Voices.Get(cfg.Provider); pErr == nil {
+			prov = resolvedProv
+		}
+	}
+
+	loc, err := time.LoadLocation(cfg.Timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	sysVars := variables.SystemForCall(startedAt, loc, convIDForVars, agentID, callerID, toNumber, callSid, cfg.Timezone)
+	for k, v := range sysVars {
+		ps.allVars[k] = v
+	}
+
+	if ps.allVars["primNome"] == "" && ps.allVars["priNome"] != "" {
+		ps.allVars["primNome"] = ps.allVars["priNome"]
+	}
+	if ps.allVars["priNome"] == "" && ps.allVars["primNome"] != "" {
+		ps.allVars["priNome"] = ps.allVars["primNome"]
+	}
+	if ps.allVars["primNome"] == "" && ps.allVars["nome"] != "" {
+		fields := strings.Fields(ps.allVars["nome"])
+		if len(fields) > 0 {
+			ps.allVars["primNome"] = fields[0]
+			ps.allVars["priNome"] = fields[0]
+		}
+	}
+
+	firstMessage := variables.Render(cfg.FirstMessage, ps.allVars)
+	systemPrompt := variables.Render(cfg.SystemPrompt, ps.allVars)
+	if cfg.Language != "" {
+		systemPrompt += fmt.Sprintf("\n\nDIRETRIZ DE IDIOMA: Responda obrigatoriamente no idioma configurado (%s). Fale em ritmo ágil, natural e fluido. Tags entre colchetes como [super fast] são marcações de ritmo de fala e jamais devem ser lidas em voz alta.", cfg.Language)
+	}
+	if strings.TrimSpace(firstMessage) != "" {
+		systemPrompt += fmt.Sprintf("\n\nREGRA OBRIGATÓRIA DE PRIMEIRA MENSAGEM: Na sua PRIMEIRA fala ao iniciar a conversa, você DEVE dizer EXCLUSIVAMENTE a frase de abertura configurada (%q) e PARAR de falar para aguardar a resposta do cliente. Só inicie o passo 1 de # Actions DEPOIS que o cliente responder à sua primeira mensagem.", firstMessage)
+	}
+
+	if len(cfg.Procedures) == 0 && rt.Store != nil {
+		if draftCfg, dErr := rt.Store.DraftConfig(ctx, orgID, store.Agent{ID: agentID, OrganizationID: orgID}); dErr == nil && len(draftCfg.Procedures) > 0 {
+			cfg.Procedures = draftCfg.Procedures
+		}
+	}
+
+	for _, rawProc := range cfg.Procedures {
+		if !rawProc.Active {
+			continue
+		}
+		p := rawProc
+		p.Trigger = variables.Render(p.Trigger, ps.allVars)
+		p.Content = variables.Render(p.Content, ps.allVars)
+		if len(p.Guardrails) > 0 {
+			renderedGuards := make([]string, len(p.Guardrails))
+			for i, g := range p.Guardrails {
+				renderedGuards[i] = variables.Render(g, ps.allVars)
+			}
+			p.Guardrails = renderedGuards
+		}
+		ps.procsMap[p.ID] = p
+		ps.activeProcedures = append(ps.activeProcedures, p)
+	}
+
+	referencedAsSubProc := make(map[string]bool)
+	for _, p := range ps.activeProcedures {
+		meta := procedures.InspectProcedure(store.Procedure{
+			ID:      p.ID,
+			Name:    p.Name,
+			Type:    p.Type,
+			Trigger: p.Trigger,
+			Content: p.Content,
+		}, ps.procsMap, nil, nil)
+		for _, refID := range meta.ReferencedProcedureIDs {
+			referencedAsSubProc[refID] = true
+			for _, cand := range ps.activeProcedures {
+				if strings.EqualFold(strings.TrimSpace(cand.Name), strings.TrimSpace(refID)) {
+					referencedAsSubProc[cand.ID] = true
+				}
+			}
+		}
+	}
+
+	for _, p := range ps.activeProcedures {
+		if strings.TrimSpace(p.Trigger) != "" {
+			ps.entryProcedures = append(ps.entryProcedures, p)
+		} else if !referencedAsSubProc[p.ID] {
+			p.Trigger = "Quando o atendimento envolver " + p.Name
+			ps.entryProcedures = append(ps.entryProcedures, p)
+		}
+	}
+
+	procExpander := procedures.NewExpander(rt.Store)
+	systemPrompt = procExpander.ExpandInlineReferences(ctx, orgID, systemPrompt, ps.procsMap, ps.promptReferencedTools)
+
+	for _, st := range cfg.SystemTools {
+		if st == "encerrar_conversa" {
+			ps.toolSpecs = append(ps.toolSpecs,
+				voice.ToolSpec{
+					Name:        "encerrar_conversa",
+					Description: "Encerra a conversa com o Caller após se despedir cordialmente.",
+					Parameters:  []voice.Param{},
+				},
+				voice.ToolSpec{
+					Name:        "end_call",
+					Description: "Encerra a chamada telefônica imediatamente após a despedida cordial.",
+					Parameters:  []voice.Param{},
+				},
+			)
+		} else if st == "transferir_numero" {
+			ps.toolSpecs = append(ps.toolSpecs, voice.ToolSpec{
+				Name:        "transferir_numero",
+				Description: "Transfere a chamada telefônica para outro número ou ramal após avisar o Caller.",
+				Parameters: []voice.Param{
+					{Name: "numero", Type: "string", Description: "Número de telefone de destino no formato E.164 ou ramal (ex: +5511999998888)", Required: true},
+					{Name: "motivo", Type: "string", Description: "Motivo ou departamento da transferência (ex: financeiro, suporte humano)", Required: false},
+				},
+			})
+		} else if st == "transferir_agente" || st == "transfer_to_agent" {
+			transferDesc := "Transfere a conversa em andamento para outro agente de IA especializado quando a condição correspondente for atendida."
+			var rulesPrompt strings.Builder
+			if cfg.SystemToolsConfig.TransferToAgent != nil {
+				if customDesc := strings.TrimSpace(cfg.SystemToolsConfig.TransferToAgent.Description); customDesc != "" {
+					transferDesc = customDesc
+				}
+				if len(cfg.SystemToolsConfig.TransferToAgent.Transfers) > 0 {
+					rulesPrompt.WriteString("\n\n## REGRAS DE TRANSFERÊNCIA ENTRE AGENTES (transfer_to_agent):\nQuando a solicitação do usuário atender a uma das condições abaixo, diga a frase de encaminhamento e CHAME IMEDIATAMENTE NO MESMO TURNO a ferramenta \"transfer_to_agent\" passando \"agent_number\" (indexado a partir de 0) e \"reason\":\n")
+					for idx, rule := range cfg.SystemToolsConfig.TransferToAgent.Transfers {
+						targetLabel := rule.AgentName
+						if targetLabel == "" && rt.Store != nil {
+							if ta, err := rt.Store.GetAgent(ctx, orgID, rule.AgentID); err == nil {
+								targetLabel = ta.Name
+							} else {
+								targetLabel = rule.AgentID
+							}
+						}
+						rulesPrompt.WriteString(fmt.Sprintf("- agent_number = %d (Agente %q): %s\n", idx, targetLabel, rule.Condition))
+					}
+					transferDesc += " " + rulesPrompt.String()
+					systemPrompt += rulesPrompt.String()
+				}
+			}
+			transferParams := []voice.Param{
+				{Name: "agent_number", Type: "integer", Description: "Número indexado a partir de zero (0, 1, 2...) do agente para o qual transferir com base nas regras configuradas", Required: true},
+				{Name: "reason", Type: "string", Description: "O motivo da transferência do agente", Required: false},
+			}
+			ps.toolSpecs = append(ps.toolSpecs,
+				voice.ToolSpec{
+					Name:        "transfer_to_agent",
+					Description: transferDesc,
+					Parameters:  transferParams,
+				},
+				voice.ToolSpec{
+					Name:        "transferir_agente",
+					Description: transferDesc,
+					Parameters:  transferParams,
+				},
+			)
+		}
+	}
+
+	if len(ps.entryProcedures) > 0 {
+		var triggerIndex strings.Builder
+		var procNamesList []string
+		triggerIndex.WriteString("## PROCEDIMENTOS E GATILHOS OBRIGATÓRIOS DO AGENTE (PRIORIDADE MÁXIMA SOBRE O PROMPT GERAL):\n")
+		triggerIndex.WriteString("ATENÇÃO CRÍTICA: Os procedimentos abaixo têm precedência absoluta sobre quaisquer instruções gerais ou seções '# Actions' do prompt. Sempre que a fala do cliente acionar o gatilho (Trigger) de um procedimento abaixo (por exemplo: falar em nome de terceiro/familiar como marido, esposa, mãe, filho ou dependente; pedir segunda via de boleto/fatura; ou informar CPF), você DEVE seguir estritamente as regras e perguntas obrigatórias desse procedimento na ordem exata:\n")
+		for _, p := range ps.entryProcedures {
+			procNamesList = append(procNamesList, fmt.Sprintf("%q (%s)", p.Name, p.Trigger))
+			triggerIndex.WriteString(fmt.Sprintf("\n### PROCEDIMENTO: %q\n- **Quando acionar (Trigger):** %s\n", p.Name, p.Trigger))
+			if expanded, expErr := procExpander.ExpandProcedure(ctx, orgID, agentID, p, ps.procsMap); expErr == nil && strings.TrimSpace(expanded.ExpandedContent) != "" {
+				triggerIndex.WriteString(expanded.ExpandedContent)
+				triggerIndex.WriteString("\n")
+				for tName, ok := range expanded.AllowedTools {
+					if ok {
+						ps.promptReferencedTools[tName] = true
+					}
+				}
+			} else if strings.TrimSpace(p.Content) != "" {
+				triggerIndex.WriteString(p.Content)
+				triggerIndex.WriteString("\n")
+			}
+		}
+		for _, p := range ps.activeProcedures {
+			if referencedAsSubProc[p.ID] {
+				triggerIndex.WriteString(fmt.Sprintf("\n### PROCEDIMENTO COMPLEMENTAR OBRIGATÓRIO: %q\n- **Quando acionar (Trigger):** %s\n", p.Name, p.Trigger))
+				if expanded, expErr := procExpander.ExpandProcedure(ctx, orgID, agentID, p, ps.procsMap); expErr == nil && strings.TrimSpace(expanded.ExpandedContent) != "" {
+					triggerIndex.WriteString(expanded.ExpandedContent)
+					triggerIndex.WriteString("\n")
+					for tName, ok := range expanded.AllowedTools {
+						if ok {
+							ps.promptReferencedTools[tName] = true
+						}
+					}
+				}
+			}
+		}
+		// Posiciona os procedimentos no TOPO do systemPrompt para garantir precedência sem duplicar tokens
+		systemPrompt = triggerIndex.String() + "\n\n---\n\n" + systemPrompt + "\n\n[Lembrete: siga estritamente os procedimentos obrigatórios no topo deste prompt sempre que seus gatilhos forem acionados.]"
+
+		ps.toolSpecs = append(ps.toolSpecs, voice.ToolSpec{
+			Name:        "ativar_procedure",
+			Description: "Ativa um procedimento de negócio quando o assunto do Caller corresponder ao seu gatilho: " + strings.Join(procNamesList, "; "),
+			Parameters: []voice.Param{
+				{Name: "nome", Type: "string", Description: "Nome exato do procedimento a ativar", Required: true},
+			},
+		})
+	}
+
+	mcpSummaryLines := rt.bindAgentToolsAndMCP(
+		ctx, orgID, convIDForVars, addDeferred, cfg.Tools, cfg.SystemPrompt, ps.activeProcedures, ps.procsMap, ps.allVars,
+		&ps.toolSpecs, ps.registeredTools, ps.mcpSessions, ps.mcpBindings,
+	)
+	if len(mcpSummaryLines) > 0 {
+		systemPrompt += "\n\n## FERRAMENTAS DE INTEGRAÇÃO MCP CONECTADAS:\n" +
+			"Quando um procedimento mencionar uma integração MCP pelo nome do servidor, chame diretamente a ferramenta específica listada abaixo correspondente à solicitação do usuário:\n" +
+			strings.Join(mcpSummaryLines, "\n")
+	}
+
+	ps.cfg = cfg
+	ps.prov = prov
+	if prov != nil {
+		ps.cat = prov.Catalog()
+	}
+	ps.firstMessage = firstMessage
+	ps.systemPrompt = systemPrompt
+
+	provSess, err := prov.Connect(ctx, voice.SessionConfig{
+		Model:           cfg.Model,
+		DelegationModel: cfg.SystemToolsConfig.DelegationModel,
+		Voice:           cfg.Voice,
+		Language:        cfg.Language,
+		SystemPrompt:    systemPrompt,
+		FirstMessage:    firstMessage,
+		ThinkingLevel:   "",
+		Tools:           ps.toolSpecs,
+	})
+	if err != nil {
+		for _, ms := range ps.mcpSessions {
+			if ms != nil {
+				ms.Close()
+			}
+		}
+		ps.mcpSessions = nil
+		return ps, err
+	}
+
+	ps.provSess = provSess
+	return ps, nil
+}
+
 func (rt *Runtime) RunSessionWithOptions(
 	ctx context.Context,
 	opts SessionOptions,
@@ -93,7 +481,46 @@ func (rt *Runtime) RunSessionWithOptions(
 		return
 	}
 
+	// Fila assíncrona ordenada para gravar eventos no banco sem nunca bloquear os frames de áudio em tempo real
+	eventQueue := make(chan deferredConvEvent, 512)
+	eventWorkerDone := make(chan struct{})
+	var eventQueueMu sync.Mutex
+	eventQueueClosed := false
+	go func() {
+		defer close(eventWorkerDone)
+		bgCtx := context.Background()
+		for item := range eventQueue {
+			_ = rt.Store.RecordEvent(bgCtx, orgID, conv.ID, item.Type, item.Payload)
+		}
+	}()
+	recordEventAsync := func(evType string, payload any) {
+		eventQueueMu.Lock()
+		if eventQueueClosed {
+			eventQueueMu.Unlock()
+			return
+		}
+		select {
+		case eventQueue <- deferredConvEvent{Type: evType, Payload: payload}:
+			eventQueueMu.Unlock()
+		default:
+			eventQueueMu.Unlock()
+			go func() {
+				_ = rt.Store.RecordEvent(context.Background(), orgID, conv.ID, evType, payload)
+			}()
+		}
+	}
+	flushEvents := func() {
+		eventQueueMu.Lock()
+		if !eventQueueClosed {
+			eventQueueClosed = true
+			close(eventQueue)
+		}
+		eventQueueMu.Unlock()
+		<-eventWorkerDone
+	}
+
 	endCall := func(status, reason string) billing.CostResult {
+		flushEvents()
 		dur := time.Since(startedAt).Milliseconds()
 		sessionUsageMu.Lock()
 		finalUsage := sessionUsage
@@ -111,194 +538,65 @@ func (rt *Runtime) RunSessionWithOptions(
 		return calcRes
 	}
 
-	// 2. Resolve variáveis
-	allVars := map[string]string{}
-	for _, decl := range cfg.Variables {
-		allVars[decl.Name] = ""
-	}
-
 	callerID := opts.FromNumber
 	if callerID == "" {
 		callerID = caller
 	}
 
-	// Dynamic variables + Overrides via Initiation Webhook (padrão ElevenLabs Twilio Personalization)
-	if cfg.InitiationWebhookURL != "" {
-		var initRes variables.InitiationResult
-		var initErr error
-
-		if prefRes, ok, prefErr := rt.consumePrefetchedInitiation(ctx, opts.CallSid); ok {
-			initRes, initErr = prefRes, prefErr
-		} else {
-			timeout := time.Duration(cfg.InitiationWebhookTimeout) * time.Millisecond
-			if timeout <= 0 {
-				timeout = 3 * time.Second
-			}
-			initRes, initErr = variables.FetchInitiationData(
-				ctx,
-				rt.HTTPClient,
-				cfg.InitiationWebhookURL,
-				timeout,
-				variables.InitiationRequest{
-					CallerID:       callerID,
-					AgentID:        agentID,
-					CalledNumber:   opts.ToNumber,
-					CallSid:        opts.CallSid,
-					ConversationID: conv.ID,
-					Caller:         callerID,
-					Metadata:       map[string]any{},
-				},
-				cfg.Variables,
-			)
-		}
-
-		if initErr != nil {
-			rt.Log.Warn("initiation_webhook_failed", "conversation_id", conv.ID, "caller_id", callerID, "error", initErr)
-			_ = rt.Store.RecordEvent(ctx, orgID, conv.ID, "initiation_webhook_warning", map[string]any{
-				"phase": "initiation",
-				"error": initErr.Error(),
-			})
-		} else {
-			for k, v := range initRes.DynamicVariables {
-				allVars[k] = v
-			}
-			if len(initRes.MissingVariables) > 0 {
-				rt.Log.Warn("initiation_webhook_missing_vars", "conversation_id", conv.ID, "missing", initRes.MissingVariables)
-			}
-			// Aplica conversation_config_override se retornado pelo webhook (padrão ElevenLabs)
-			if ov := initRes.ConversationConfigOverride; ov != nil {
-				if ov.Agent != nil {
-					if ov.Agent.Prompt != nil {
-						if strings.TrimSpace(ov.Agent.Prompt.Prompt) != "" {
-							cfg.SystemPrompt = ov.Agent.Prompt.Prompt
-						}
-						if strings.TrimSpace(ov.Agent.Prompt.LLM) != "" {
-							cfg.Model = ov.Agent.Prompt.LLM
-						}
-					}
-					if strings.TrimSpace(ov.Agent.FirstMessage) != "" {
-						cfg.FirstMessage = ov.Agent.FirstMessage
-					}
-					if strings.TrimSpace(ov.Agent.Language) != "" {
-						cfg.Language = ov.Agent.Language
-					}
-				}
-				if ov.TTS != nil && strings.TrimSpace(ov.TTS.VoiceID) != "" {
-					cfg.Voice = ov.TTS.VoiceID
-				}
-			}
-			_ = rt.Store.RecordEvent(ctx, orgID, conv.ID, "initiation_webhook_loaded", map[string]any{
-				"dynamic_variables": initRes.DynamicVariables,
-				"has_overrides":     initRes.ConversationConfigOverride != nil,
-			})
-		}
-	}
-
-	// System variables no fuso do agente (incluindo system__caller_id, system__called_number, system__call_sid, etc.)
-	loc, err := time.LoadLocation(cfg.Timezone)
-	if err != nil {
-		loc = time.UTC
-	}
-	sysVars := variables.SystemForCall(startedAt, loc, conv.ID, agentID, callerID, opts.ToNumber, opts.CallSid, cfg.Timezone)
-	for k, v := range sysVars {
-		allVars[k] = v
-	}
-
-	// Alias inteligente priNome <-> primNome e fallback a partir da primeira palavra de "nome"
-	if allVars["primNome"] == "" && allVars["priNome"] != "" {
-		allVars["primNome"] = allVars["priNome"]
-	}
-	if allVars["priNome"] == "" && allVars["primNome"] != "" {
-		allVars["priNome"] = allVars["primNome"]
-	}
-	if allVars["primNome"] == "" && allVars["nome"] != "" {
-		fields := strings.Fields(allVars["nome"])
-		if len(fields) > 0 {
-			allVars["primNome"] = fields[0]
-			allVars["priNome"] = fields[0]
-		}
-	}
-
-	// Atualiza snapshot das variáveis resolvidas na conversa
-	rawVars, _ := json.Marshal(allVars)
-	_, _ = rt.Store.Pool.Exec(ctx, `UPDATE conversations SET variables = $3 WHERE organization_id = $1 AND id = $2`, orgID, conv.ID, rawVars)
-
-	// 3. Renderiza prompts
-	firstMessage := variables.Render(cfg.FirstMessage, allVars)
-	systemPrompt := variables.Render(cfg.SystemPrompt, allVars)
-	if cfg.Language != "" {
-		systemPrompt += fmt.Sprintf("\n\nDIRETRIZ DE IDIOMA: Responda obrigatoriamente no idioma configurado (%s). Fale em ritmo ágil, natural e fluido. Tags entre colchetes como [super fast] são marcações de ritmo de fala e jamais devem ser lidas em voz alta.", cfg.Language)
-	}
-	if strings.TrimSpace(firstMessage) != "" {
-		systemPrompt += fmt.Sprintf("\n\nREGRA OBRIGATÓRIA DE PRIMEIRA MENSAGEM: Na sua PRIMEIRA fala ao iniciar a conversa, você DEVE dizer EXCLUSIVAMENTE a frase de abertura configurada (%q) e PARAR de falar para aguardar a resposta do cliente. Só inicie o passo 1 de # Actions DEPOIS que o cliente responder à sua primeira mensagem.", firstMessage)
-	}
-
-	// 4. Carrega Procedures e monta índice de Triggers (ADR 0001 + Sub-procedures ElevenLabs)
-	if len(cfg.Procedures) == 0 {
-		if draftCfg, dErr := rt.Store.DraftConfig(ctx, orgID, store.Agent{ID: agentID, OrganizationID: orgID}); dErr == nil && len(draftCfg.Procedures) > 0 {
-			cfg.Procedures = draftCfg.Procedures
-		}
-	}
-
-	procsMap := make(map[string]store.ProcedureSnapshot)
-	var activeProcedures []store.ProcedureSnapshot
-	for _, rawProc := range cfg.Procedures {
-		if !rawProc.Active {
-			continue
-		}
-		p := rawProc
-		p.Trigger = variables.Render(p.Trigger, allVars)
-		p.Content = variables.Render(p.Content, allVars)
-		if len(p.Guardrails) > 0 {
-			renderedGuards := make([]string, len(p.Guardrails))
-			for i, g := range p.Guardrails {
-				renderedGuards[i] = variables.Render(g, allVars)
-			}
-			p.Guardrails = renderedGuards
-		}
-		procsMap[p.ID] = p
-		activeProcedures = append(activeProcedures, p)
-	}
-
-	// Identifica quais procedures são referenciados como sub-procedures por outros procedures
-	referencedAsSubProc := make(map[string]bool)
-	for _, p := range activeProcedures {
-		meta := procedures.InspectProcedure(store.Procedure{
-			ID:      p.ID,
-			Name:    p.Name,
-			Type:    p.Type,
-			Trigger: p.Trigger,
-			Content: p.Content,
-		}, procsMap, nil, nil)
-		for _, refID := range meta.ReferencedProcedureIDs {
-			referencedAsSubProc[refID] = true
-			for _, cand := range activeProcedures {
-				if strings.EqualFold(strings.TrimSpace(cand.Name), strings.TrimSpace(refID)) {
-					referencedAsSubProc[cand.ID] = true
-				}
-			}
-		}
-	}
-
-	var entryProcedures []store.ProcedureSnapshot
-	for _, p := range activeProcedures {
-		if strings.TrimSpace(p.Trigger) != "" {
-			entryProcedures = append(entryProcedures, p)
-		} else if !referencedAsSubProc[p.ID] {
-			p.Trigger = "Quando o atendimento envolver " + p.Name
-			entryProcedures = append(entryProcedures, p)
-		}
-	}
-
 	executor := tools.NewExecutor(rt.HTTPClient)
 	procExpander := procedures.NewExpander(rt.Store)
-	promptReferencedTools := make(map[string]bool)
-	systemPrompt = procExpander.ExpandInlineReferences(ctx, orgID, systemPrompt, procsMap, promptReferencedTools)
 
-	var toolSpecs []voice.ToolSpec
-	registeredTools := make(map[string]store.Tool)
-	mcpSessions := make(map[string]*tools.MCPSession)
-	mcpBindings := make(map[string]mcpToolBinding)
+	// 2. Consome sessão pré-aquecida durante o webhook da telefonia (se disponível) ou prepara/conecta agora
+	var ps *preparedSession
+	if prewarmPS, wasPrewarmed, prewarmErr := rt.consumePrewarmedCall(ctx, opts.CallSid); wasPrewarmed && prewarmErr == nil && prewarmPS != nil && prewarmPS.provSess != nil {
+		ps = prewarmPS
+		ps.allVars["system__conversation_id"] = conv.ID
+	} else {
+		if prewarmPS != nil {
+			for _, dev := range prewarmPS.deferredEvents {
+				recordEventAsync(dev.Type, dev.Payload)
+			}
+			prewarmPS.cleanup()
+		}
+		ps, err = rt.prepareSession(ctx, startedAt, orgID, agentID, conv.ID, callerID, opts.ToNumber, opts.CallSid, cfg, prov)
+		if err != nil {
+			if ps != nil {
+				for _, dev := range ps.deferredEvents {
+					recordEventAsync(dev.Type, dev.Payload)
+				}
+				ps.cleanup()
+			}
+			rt.Log.Error("provider_connect_failed", "conversation_id", conv.ID, "provider", cfg.Provider, "error", err)
+			recordEventAsync("error", map[string]any{"phase": "connect", "error": err.Error()})
+			endCall("failed", "provider_error")
+			sendJSON(serverMessage{Type: "error", Message: fmt.Sprintf("falha ao conectar com o Voice Provider: %v", err)})
+			return
+		}
+	}
+
+	if ps.cancelLifetime != nil {
+		defer ps.cancelLifetime()
+	}
+
+	cfg = ps.cfg
+	if ps.prov != nil {
+		prov = ps.prov
+		cat = ps.cat
+	}
+	allVars := ps.allVars
+	firstMessage := ps.firstMessage
+	procsMap := ps.procsMap
+	activeProcedures := ps.activeProcedures
+	entryProcedures := ps.entryProcedures
+	promptReferencedTools := ps.promptReferencedTools
+	registeredTools := ps.registeredTools
+	mcpSessions := ps.mcpSessions
+	mcpBindings := ps.mcpBindings
+	provSess := ps.provSess
+
+	for _, dev := range ps.deferredEvents {
+		recordEventAsync(dev.Type, dev.Payload)
+	}
 
 	defer func() {
 		for _, ms := range mcpSessions {
@@ -308,148 +606,6 @@ func (rt *Runtime) RunSessionWithOptions(
 		}
 	}()
 
-	for _, st := range cfg.SystemTools {
-		if st == "encerrar_conversa" {
-			toolSpecs = append(toolSpecs,
-				voice.ToolSpec{
-					Name:        "encerrar_conversa",
-					Description: "Encerra a conversa com o Caller após se despedir cordialmente.",
-					Parameters:  []voice.Param{},
-				},
-				voice.ToolSpec{
-					Name:        "end_call",
-					Description: "Encerra a chamada telefônica imediatamente após a despedida cordial.",
-					Parameters:  []voice.Param{},
-				},
-			)
-		} else if st == "transferir_numero" {
-			toolSpecs = append(toolSpecs, voice.ToolSpec{
-				Name:        "transferir_numero",
-				Description: "Transfere a chamada telefônica para outro número ou ramal após avisar o Caller.",
-				Parameters: []voice.Param{
-					{Name: "numero", Type: "string", Description: "Número de telefone de destino no formato E.164 ou ramal (ex: +5511999998888)", Required: true},
-					{Name: "motivo", Type: "string", Description: "Motivo ou departamento da transferência (ex: financeiro, suporte humano)", Required: false},
-				},
-			})
-		} else if st == "transferir_agente" || st == "transfer_to_agent" {
-			transferDesc := "Transfere a conversa em andamento para outro agente de IA especializado quando a condição correspondente for atendida."
-			var rulesPrompt strings.Builder
-			if cfg.SystemToolsConfig.TransferToAgent != nil {
-				if customDesc := strings.TrimSpace(cfg.SystemToolsConfig.TransferToAgent.Description); customDesc != "" {
-					transferDesc = customDesc
-				}
-				if len(cfg.SystemToolsConfig.TransferToAgent.Transfers) > 0 {
-					rulesPrompt.WriteString("\n\n## REGRAS DE TRANSFERÊNCIA ENTRE AGENTES (transfer_to_agent):\nQuando a solicitação do usuário atender a uma das condições abaixo, diga a frase de encaminhamento e CHAME IMEDIATAMENTE NO MESMO TURNO a ferramenta \"transfer_to_agent\" passando \"agent_number\" (indexado a partir de 0) e \"reason\":\n")
-					for idx, rule := range cfg.SystemToolsConfig.TransferToAgent.Transfers {
-						targetLabel := rule.AgentName
-						if targetLabel == "" {
-							if ta, err := rt.Store.GetAgent(ctx, orgID, rule.AgentID); err == nil {
-								targetLabel = ta.Name
-							} else {
-								targetLabel = rule.AgentID
-							}
-						}
-						rulesPrompt.WriteString(fmt.Sprintf("- agent_number = %d (Agente %q): %s\n", idx, targetLabel, rule.Condition))
-					}
-					transferDesc += " " + rulesPrompt.String()
-					systemPrompt += rulesPrompt.String()
-				}
-			}
-			transferParams := []voice.Param{
-				{Name: "agent_number", Type: "integer", Description: "Número indexado a partir de zero (0, 1, 2...) do agente para o qual transferir com base nas regras configuradas", Required: true},
-				{Name: "reason", Type: "string", Description: "O motivo da transferência do agente", Required: false},
-			}
-			toolSpecs = append(toolSpecs,
-				voice.ToolSpec{
-					Name:        "transfer_to_agent",
-					Description: transferDesc,
-					Parameters:  transferParams,
-				},
-				voice.ToolSpec{
-					Name:        "transferir_agente",
-					Description: transferDesc,
-					Parameters:  transferParams,
-				},
-			)
-		}
-	}
-
-	if len(entryProcedures) > 0 {
-		var triggerIndex strings.Builder
-		var procNamesList []string
-		triggerIndex.WriteString("## PROCEDIMENTOS E GATILHOS OBRIGATÓRIOS DO AGENTE (PRIORIDADE MÁXIMA SOBRE O PROMPT GERAL):\n")
-		triggerIndex.WriteString("ATENÇÃO CRÍTICA: Os procedimentos abaixo têm precedência absoluta sobre quaisquer instruções gerais ou seções '# Actions' do prompt. Sempre que a fala do cliente acionar o gatilho (Trigger) de um procedimento abaixo (por exemplo: falar em nome de terceiro/familiar como marido, esposa, mãe, filho ou dependente; pedir segunda via de boleto/fatura; ou informar CPF), você DEVE seguir estritamente as regras e perguntas obrigatórias desse procedimento na ordem exata:\n")
-		for _, p := range entryProcedures {
-			procNamesList = append(procNamesList, fmt.Sprintf("%q (%s)", p.Name, p.Trigger))
-			triggerIndex.WriteString(fmt.Sprintf("\n### PROCEDIMENTO: %q\n- **Quando acionar (Trigger):** %s\n", p.Name, p.Trigger))
-			if expanded, expErr := procExpander.ExpandProcedure(ctx, orgID, agentID, p, procsMap); expErr == nil && strings.TrimSpace(expanded.ExpandedContent) != "" {
-				triggerIndex.WriteString(expanded.ExpandedContent)
-				triggerIndex.WriteString("\n")
-				for tName, ok := range expanded.AllowedTools {
-					if ok {
-						promptReferencedTools[tName] = true
-					}
-				}
-			} else if strings.TrimSpace(p.Content) != "" {
-				triggerIndex.WriteString(p.Content)
-				triggerIndex.WriteString("\n")
-			}
-		}
-		// Também inclui no bloco quaisquer sub-procedures ativos que possuam regras próprias (ex: Identificação/Autorização)
-		for _, p := range activeProcedures {
-			if referencedAsSubProc[p.ID] {
-				triggerIndex.WriteString(fmt.Sprintf("\n### PROCEDIMENTO COMPLEMENTAR OBRIGATÓRIO: %q\n- **Quando acionar (Trigger):** %s\n", p.Name, p.Trigger))
-				if expanded, expErr := procExpander.ExpandProcedure(ctx, orgID, agentID, p, procsMap); expErr == nil && strings.TrimSpace(expanded.ExpandedContent) != "" {
-					triggerIndex.WriteString(expanded.ExpandedContent)
-					triggerIndex.WriteString("\n")
-					for tName, ok := range expanded.AllowedTools {
-						if ok {
-							promptReferencedTools[tName] = true
-						}
-					}
-				}
-			}
-		}
-		// Posiciona os procedimentos no TOPO do systemPrompt para garantir precedência sem duplicar tokens
-		systemPrompt = triggerIndex.String() + "\n\n---\n\n" + systemPrompt + "\n\n[Lembrete: siga estritamente os procedimentos obrigatórios no topo deste prompt sempre que seus gatilhos forem acionados.]"
-
-		toolSpecs = append(toolSpecs, voice.ToolSpec{
-			Name:        "ativar_procedure",
-			Description: "Ativa um procedimento de negócio quando o assunto do Caller corresponder ao seu gatilho: " + strings.Join(procNamesList, "; "),
-			Parameters: []voice.Param{
-				{Name: "nome", Type: "string", Description: "Nome exato do procedimento a ativar", Required: true},
-			},
-		})
-	}
-
-	mcpSummaryLines := rt.bindAgentToolsAndMCP(
-		ctx, orgID, conv.ID, cfg.Tools, cfg.SystemPrompt, activeProcedures, procsMap, allVars,
-		&toolSpecs, registeredTools, mcpSessions, mcpBindings,
-	)
-	if len(mcpSummaryLines) > 0 {
-		systemPrompt += "\n\n## FERRAMENTAS DE INTEGRAÇÃO MCP CONECTADAS:\n" +
-			"Quando um procedimento mencionar uma integração MCP pelo nome do servidor, chame diretamente a ferramenta específica listada abaixo correspondente à solicitação do usuário:\n" +
-			strings.Join(mcpSummaryLines, "\n")
-	}
-
-	// 5. Conecta com o Voice Provider
-	provSess, err := prov.Connect(ctx, voice.SessionConfig{
-		Model:           cfg.Model,
-		DelegationModel: cfg.SystemToolsConfig.DelegationModel,
-		Voice:           cfg.Voice,
-		Language:        cfg.Language,
-		SystemPrompt:    systemPrompt,
-		FirstMessage:    firstMessage,
-		ThinkingLevel:   "",
-		Tools:           toolSpecs,
-	})
-	if err != nil {
-		rt.Log.Error("provider_connect_failed", "conversation_id", conv.ID, "provider", cfg.Provider, "error", err)
-		_ = rt.Store.RecordEvent(ctx, orgID, conv.ID, "error", map[string]any{"phase": "connect", "error": err.Error()})
-		endCall("failed", "provider_error")
-		sendJSON(serverMessage{Type: "error", Message: fmt.Sprintf("falha ao conectar com o Voice Provider: %v", err)})
-		return
-	}
 	var provSessMu sync.RWMutex
 	getProvSess := func() voice.Session {
 		provSessMu.RLock()
@@ -464,7 +620,17 @@ func (rt *Runtime) RunSessionWithOptions(
 		}
 	}()
 
-	_ = rt.Store.MarkConversationActive(ctx, orgID, conv.ID)
+	// Persiste variáveis e status ativo em background sem atrasar o primeiro pacote de áudio
+	varsSnapshot := make(map[string]string, len(allVars))
+	for k, v := range allVars {
+		varsSnapshot[k] = v
+	}
+	go func() {
+		bgCtx := context.Background()
+		rawVars, _ := json.Marshal(varsSnapshot)
+		_, _ = rt.Store.Pool.Exec(bgCtx, `UPDATE conversations SET variables = $3 WHERE organization_id = $1 AND id = $2`, orgID, conv.ID, rawVars)
+		_ = rt.Store.MarkConversationActive(bgCtx, orgID, conv.ID)
+	}()
 
 	// Envia mensagem ready para o navegador
 	_ = sendJSON(serverMessage{
@@ -486,7 +652,7 @@ func (rt *Runtime) RunSessionWithOptions(
 
 	// 5. Inicia First Message se configurada (se o provider já não disparou no Connect)
 	if firstMessage != "" {
-		_ = rt.Store.RecordEvent(ctx, orgID, conv.ID, "first_message_sent", map[string]any{"text": firstMessage})
+		recordEventAsync("first_message_sent", map[string]any{"text": firstMessage})
 		if primer, ok := provSess.(voice.FirstMessagePrimer); !ok || !primer.FirstMessagePrimed() {
 			instruction := fmt.Sprintf("ATENÇÃO (PRIMEIRO TURNO DA LIGAÇÃO): Diga agora APENAS e EXATAMENTE a seguinte frase de saudação e aguarde em silêncio o cliente responder (NÃO fale a apresentação da empresa ainda neste turno):\n\"%s\"", firstMessage)
 			if err := provSess.SendText(instruction); err != nil {
@@ -596,7 +762,7 @@ func (rt *Runtime) RunSessionWithOptions(
 
 		if newlyActivated {
 			_ = sendJSON(serverMessage{Type: "procedure_activated", Text: targetProc.Name})
-			_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "procedure_activated", map[string]any{
+			recordEventAsync("procedure_activated", map[string]any{
 				"procedure_id": targetProc.ID,
 				"name":         targetProc.Name,
 				"trigger":      targetProc.Trigger,
@@ -726,15 +892,15 @@ func (rt *Runtime) RunSessionWithOptions(
 					agentPlaybackEndsAt = agentPlaybackEndsAt.Add(chunkDur)
 					playbackMu.Unlock()
 					rec.AddAgentAudio(ev.Audio)
-					if !lastCallerSpeechEnd.IsZero() {
-						latencyMS := time.Since(lastCallerSpeechEnd).Milliseconds()
-						_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "response_latency", map[string]any{
-							"latency_ms": latencyMS, "had_tool_call": turnHadToolCall,
-						})
-						lastCallerSpeechEnd = time.Time{}
-					}
 					if err := sendBinary(ev.Audio); err != nil {
 						return
+					}
+					if !lastCallerSpeechEnd.IsZero() {
+						latencyMS := time.Since(lastCallerSpeechEnd).Milliseconds()
+						lastCallerSpeechEnd = time.Time{}
+						recordEventAsync("response_latency", map[string]any{
+							"latency_ms": latencyMS, "had_tool_call": turnHadToolCall,
+						})
 					}
 
 				case voice.EventCallerSpeechEnd:
@@ -780,7 +946,7 @@ func (rt *Runtime) RunSessionWithOptions(
 						}
 					}
 					_ = sendJSON(serverMessage{Type: "caller_transcript", Text: normCaller})
-					_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "caller_transcript", map[string]any{"text": normCaller})
+					recordEventAsync("caller_transcript", map[string]any{"text": normCaller})
 
 					// Avaliação automática em tempo real dos gatilhos (Triggers) dos procedimentos a partir da fala do Caller
 					if trimmedCaller != "" && len(activeProcedures) > 0 {
@@ -815,7 +981,7 @@ func (rt *Runtime) RunSessionWithOptions(
 						appendStreamDelta(&currentTurnAgentText, ev.Text)
 					}
 					_ = sendJSON(serverMessage{Type: "agent_transcript", Text: ev.Text})
-					_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "agent_transcript", map[string]any{"text": ev.Text})
+					recordEventAsync("agent_transcript", map[string]any{"text": ev.Text})
 
 				case voice.EventInterrupted:
 					if callEnding.Load() || pendingHangupAfterTurn {
@@ -826,7 +992,7 @@ func (rt *Runtime) RunSessionWithOptions(
 					playbackMu.Unlock()
 					rec.TruncateAgentOnInterruption()
 					_ = sendJSON(serverMessage{Type: "interrupted"})
-					_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "interruption", map[string]any{})
+					recordEventAsync("interruption", map[string]any{})
 
 				case voice.EventUsage:
 					if ev.Usage != nil {
@@ -864,7 +1030,7 @@ func (rt *Runtime) RunSessionWithOptions(
 							sessionUsage.CachedTokens += ev.Usage.CachedTokens
 						}
 						sessionUsageMu.Unlock()
-						_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "usage", ev.Usage)
+						recordEventAsync("usage", ev.Usage)
 					}
 
 				case voice.EventTurnComplete:
@@ -1441,7 +1607,7 @@ func (rt *Runtime) RunSessionWithOptions(
 						}
 
 						childMCPLines := rt.bindAgentToolsAndMCP(
-							sessionCtx, orgID, conv.ID, targetCfg.Tools, targetCfg.SystemPrompt, newActiveProcedures, newProcsMap, allVars,
+							sessionCtx, orgID, conv.ID, recordEventAsync, targetCfg.Tools, targetCfg.SystemPrompt, newActiveProcedures, newProcsMap, allVars,
 							&childToolSpecs, newRegisteredTools, newMCPSessions, newMCPBindings,
 						)
 						if len(childMCPLines) > 0 {
@@ -1794,7 +1960,6 @@ func (rt *Runtime) RunSessionWithOptions(
 		if ev.IsAudio {
 			// Áudio PCM16 vindo do microfone do Caller
 			rec.AddCallerAudio(ev.Audio)
-			lastCallerSpeechEnd = time.Now()
 
 			if !ignoringCallerAudio.Load() {
 				// Envia o áudio do microfone/linha continuamente ao provedor sem cortar pacotes de 20ms,
@@ -2053,6 +2218,7 @@ type mcpToolBinding struct {
 func (rt *Runtime) bindAgentToolsAndMCP(
 	ctx context.Context,
 	orgID, convID string,
+	onEvent func(evType string, payload any),
 	cfgToolIDs []string,
 	rawPrompt string,
 	activeProcedures []store.ProcedureSnapshot,
@@ -2063,6 +2229,15 @@ func (rt *Runtime) bindAgentToolsAndMCP(
 	mcpSessions map[string]*tools.MCPSession,
 	mcpBindings map[string]mcpToolBinding,
 ) []string {
+	emitEvent := func(evType string, payload any) {
+		if onEvent != nil {
+			onEvent(evType, payload)
+			return
+		}
+		if rt.Store != nil && convID != "" {
+			_ = rt.Store.RecordEvent(ctx, orgID, convID, evType, payload)
+		}
+	}
 	addedToolIDs := make(map[string]bool)
 	usedToolNames := make(map[string]bool)
 	for _, ts := range *toolSpecs {
@@ -2134,7 +2309,7 @@ func (rt *Runtime) bindAgentToolsAndMCP(
 			defer wg.Done()
 			discCtx, discCancel := context.WithTimeout(ctx, 6*time.Second)
 			defer discCancel()
-			sess, remoteTools, discErr := tools.ConnectMCPSession(discCtx, rt.HTTPClient, toolItem, allVars)
+			sess, remoteTools, discErr := tools.ConnectOrWarmMCPSession(discCtx, rt.HTTPClient, toolItem, allVars)
 			mcpMu.Lock()
 			mcpResults[toolItem.ID] = mcpResult{
 				tool:        toolItem,
@@ -2183,7 +2358,7 @@ func (rt *Runtime) bindAgentToolsAndMCP(
 					exposedNames = append(exposedNames, fnName)
 				}
 				mcpSummaryLines = append(mcpSummaryLines, fmt.Sprintf("- Servidor MCP %q (transporte %s): ferramentas disponíveis -> %s", t.Name, res.sess.TransportUsed(), strings.Join(exposedNames, ", ")))
-				_ = rt.Store.RecordEvent(ctx, orgID, convID, "mcp_connected", map[string]any{
+				emitEvent("mcp_connected", map[string]any{
 					"tool_id":    t.ID,
 					"tool_name":  t.Name,
 					"transport":  res.sess.TransportUsed(),
@@ -2199,8 +2374,10 @@ func (rt *Runtime) bindAgentToolsAndMCP(
 			if res.err != nil {
 				errText = res.err.Error()
 			}
-			rt.Log.Warn("mcp_discover_failed", "conversation_id", convID, "tool", t.Name, "url", t.Config.URL, "error", errText)
-			_ = rt.Store.RecordEvent(ctx, orgID, convID, "mcp_connection_error", map[string]any{
+			if rt.Log != nil {
+				rt.Log.Warn("mcp_discover_failed", "conversation_id", convID, "tool", t.Name, "url", t.Config.URL, "error", errText)
+			}
+			emitEvent("mcp_connection_error", map[string]any{
 				"tool_id":   t.ID,
 				"tool_name": t.Name,
 				"url":       t.Config.URL,

@@ -188,9 +188,12 @@ func (p *Provider) Connect(ctx context.Context, cfg voice.SessionConfig) (voice.
 	conn.SetReadLimit(16 * 1024 * 1024)
 
 	sess := &openAISession{
-		conn:   conn,
-		events: make(chan voice.Event, 256),
+		conn:        conn,
+		events:      make(chan voice.Event, 256),
+		updatedCh:   make(chan struct{}),
+		startedTime: time.Now(),
 	}
+	go sess.readLoop()
 
 	// Configuração da sessão na API GA do OpenAI Realtime (/v1/realtime)
 	sessionUpdate := map[string]any{
@@ -240,10 +243,18 @@ func (p *Provider) Connect(ctx context.Context, cfg voice.SessionConfig) (voice.
 		return nil, err
 	}
 
-	go sess.readLoop()
 	if fm := strings.TrimSpace(cfg.FirstMessage); fm != "" {
-		if err := sess.SendText(firstMessagePrompt(fm)); err == nil {
-			sess.firstMessagePrimed = true
+		select {
+		case <-sess.updatedCh:
+		case <-time.After(1200 * time.Millisecond):
+		case <-ctx.Done():
+			_ = sess.Close()
+			return nil, ctx.Err()
+		}
+		sess.startedTime = time.Now()
+		sess.firstMessagePrimed = true
+		if err := sess.SendText(firstMessagePrompt(fm)); err != nil {
+			sess.firstMessagePrimed = false
 		}
 	}
 	return sess, nil
@@ -269,13 +280,23 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 	conn.SetReadLimit(16 * 1024 * 1024)
 
 	sess := &openAILiveSession{
-		conn:      conn,
-		events:    make(chan voice.Event, 256),
-		startedCh: make(chan struct{}),
-		stopCh:    make(chan struct{}),
+		conn:        conn,
+		events:      make(chan voice.Event, 256),
+		startedCh:   make(chan struct{}),
+		stopCh:      make(chan struct{}),
+		startedTime: time.Now(),
 	}
 	// Começa zerado para o relógio de áudio disparar imediatamente na primeira fala antes do microfone conectar
 	sess.lastAudioAt.Store(0)
+
+	firstMsg := strings.TrimSpace(cfg.FirstMessage)
+	var prefix strings.Builder
+	if firstMsg != "" {
+		prefix.WriteString(fmt.Sprintf(
+			"PRIORIDADE MÁXIMA DE ABERTURA (PRIMEIRO TURNO): Assim que a sessão iniciar, fale IMEDIATAMENTE em voz natural APENAS e EXATAMENTE esta saudação inicial: %q — sem delegar nem chamar ferramentas neste primeiro turno — e aguarde o cliente responder.\n\n",
+			firstMsg,
+		))
+	}
 
 	var suffix strings.Builder
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(cfg.Language)), "pt") || cfg.Language == "" {
@@ -284,21 +305,21 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 	if len(cfg.Tools) > 0 {
 		suffix.WriteString("\n\nQuando precisar executar qualquer ferramenta (como encerrar_conversa, transfer_to_agent ou webhooks), delegue imediatamente ao backend.")
 	}
-	firstMsg := strings.TrimSpace(cfg.FirstMessage)
 	if firstMsg != "" {
 		suffix.WriteString(fmt.Sprintf("\n\nPRIMEIRA FALA IMEDIATA AO INICIAR: Fale imediatamente ao conectar APENAS a frase %q sem chamar ferramentas e aguarde a resposta do cliente.", firstMsg))
 	}
 
+	prefixStr := prefix.String()
 	suffixStr := suffix.String()
-	maxPromptBody := 28000 - len(suffixStr)
+	maxPromptBody := 28000 - len(prefixStr) - len(suffixStr)
 	if maxPromptBody < 1000 {
 		maxPromptBody = 1000
 	}
-	livePrompt := cfg.SystemPrompt
-	if len(livePrompt) > maxPromptBody {
-		livePrompt = livePrompt[:maxPromptBody]
+	bodyPrompt := cfg.SystemPrompt
+	if len(bodyPrompt) > maxPromptBody {
+		bodyPrompt = bodyPrompt[:maxPromptBody]
 	}
-	livePrompt += suffixStr
+	livePrompt := prefixStr + bodyPrompt + suffixStr
 
 	delegationModel := strings.TrimSpace(cfg.DelegationModel)
 	if delegationModel == "" {
@@ -349,9 +370,11 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 		return nil, ctx.Err()
 	}
 
+	sess.startedTime = time.Now()
 	if firstMsg != "" {
-		if err := sess.SendText(firstMessagePrompt(firstMsg)); err == nil {
-			sess.firstMessagePrimed = true
+		sess.firstMessagePrimed = true
+		if err := sess.triggerFirstMessage(firstMsg); err != nil {
+			sess.firstMessagePrimed = false
 		}
 	}
 
@@ -393,25 +416,29 @@ func openAITools(tools []voice.ToolSpec) []map[string]any {
 // ============================================================================
 
 type openAILiveSession struct {
-	conn               *websocket.Conn
-	events             chan voice.Event
-	startedCh          chan struct{}
-	startedOnce        sync.Once
-	stopCh             chan struct{}
-	stopOnce           sync.Once
-	writeMu            sync.Mutex
-	mu                 sync.Mutex
-	closed             bool
-	firstMessagePrimed bool
-	eventSeq           atomic.Int64
-	lastAudioAt        atomic.Int64
-	lastOutputAt       atomic.Int64
-	agentSpeaking      atomic.Bool
-	silentTailSent     atomic.Int32
-	turnTimer          *time.Timer
-	speechTimer        *time.Timer
-	prevInSample       int32
-	hasPrevSample      bool
+	conn                     *websocket.Conn
+	events                   chan voice.Event
+	startedCh                chan struct{}
+	startedOnce              sync.Once
+	stopCh                   chan struct{}
+	stopOnce                 sync.Once
+	writeMu                  sync.Mutex
+	mu                       sync.Mutex
+	closed                   bool
+	firstMessagePrimed       bool
+	startedTime              time.Time
+	firstOutputAudioReceived atomic.Bool
+	eventSeq                 atomic.Int64
+	lastAudioAt              atomic.Int64
+	nextKeepaliveAt          atomic.Int64
+	lastOutputAt             atomic.Int64
+	agentSpeaking            atomic.Bool
+	silentTailSent           atomic.Int32
+	turnTimer                *time.Timer
+	speechTimer              *time.Timer
+	firstMsgRetryTimer       *time.Timer
+	prevInSample             int32
+	hasPrevSample            bool
 }
 
 func (s *openAILiveSession) FirstMessagePrimed() bool { return s.firstMessagePrimed }
@@ -450,7 +477,7 @@ func (s *openAILiveSession) writeJSON(v any) error {
 var silenceFrame100msB64 = base64.StdEncoding.EncodeToString(make([]byte, 4800)) // 100ms em 24kHz PCM16
 
 // silenceKeepaliveLoop mantém o relógio de áudio do GPT-Live 1 avançando apenas quando não há
-// stream de microfone ativo há >= 200ms (ex: no preview de voz ou antes do cliente conectar).
+// stream de microfone ativo há >= 150ms (ex: no preview de voz ou antes do cliente conectar).
 func (s *openAILiveSession) silenceKeepaliveLoop() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -459,7 +486,11 @@ func (s *openAILiveSession) silenceKeepaliveLoop() {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
-			if time.Since(time.UnixMilli(s.lastAudioAt.Load())) >= 200*time.Millisecond {
+			nowMS := time.Now().UnixMilli()
+			if nowMS < s.nextKeepaliveAt.Load() {
+				continue
+			}
+			if time.Since(time.UnixMilli(s.lastAudioAt.Load())) >= 150*time.Millisecond {
 				_ = s.writeJSON(map[string]string{
 					"type":  "session.input_audio.append",
 					"audio": silenceFrame100msB64,
@@ -469,13 +500,60 @@ func (s *openAILiveSession) silenceKeepaliveLoop() {
 	}
 }
 
-func (s *openAILiveSession) primeAudioClock() {
-	for i := 0; i < 2; i++ {
+func (s *openAILiveSession) primeAudioClock(frames int) {
+	if frames <= 0 {
+		frames = 2
+	}
+	for i := 0; i < frames; i++ {
 		_ = s.writeJSON(map[string]string{
 			"type":  "session.input_audio.append",
 			"audio": silenceFrame100msB64,
 		})
 	}
+	if frames > 2 {
+		catchupMS := int64(frames-1) * 85
+		s.nextKeepaliveAt.Store(time.Now().Add(time.Duration(catchupMS) * time.Millisecond).UnixMilli())
+	}
+}
+
+func (s *openAILiveSession) triggerFirstMessage(firstMsg string) error {
+	if err := s.writeJSON(map[string]any{
+		"type":          "session.instructions.append",
+		"event_id":      s.nextEventID("inst"),
+		"delegation_id": nil,
+		"content":       firstMessagePrompt(firstMsg),
+	}); err != nil {
+		return err
+	}
+	// Avança imediatamente 800ms de silêncio digital puro no relógio do GPT-Live 1 para que o turn-taking
+	// dispare a fala inicial em ~200-350ms em vez de aguardar ~1.5s de ticks em tempo real.
+	s.primeAudioClock(8)
+
+	// Watchdog: caso o modelo ainda não tenha emitido áudio após 950ms, envia um reforço curto + 400ms de silêncio
+	s.mu.Lock()
+	if s.firstMsgRetryTimer != nil {
+		s.firstMsgRetryTimer.Stop()
+	}
+	s.firstMsgRetryTimer = time.AfterFunc(950*time.Millisecond, func() {
+		if s.firstOutputAudioReceived.Load() {
+			return
+		}
+		s.mu.Lock()
+		cl := s.closed
+		s.mu.Unlock()
+		if cl {
+			return
+		}
+		_ = s.writeJSON(map[string]any{
+			"type":          "session.instructions.append",
+			"event_id":      s.nextEventID("inst_retry"),
+			"delegation_id": nil,
+			"content":       fmt.Sprintf("Fale agora em voz alta imediatamente apenas a saudação inicial: %q", firstMsg),
+		})
+		s.primeAudioClock(4)
+	})
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *openAILiveSession) SendAudio(pcm16k []byte) error {
@@ -484,6 +562,11 @@ func (s *openAILiveSession) SendAudio(pcm16k []byte) error {
 	s.mu.Unlock()
 	if len(pcm24k) == 0 {
 		return nil
+	}
+	// Enquanto a primeira mensagem ainda não começou a sair em áudio, envia silêncio digital puro
+	// para impedir que cliques de microfone ou ruído de linha façam o VAD do GPT-Live cancelar a saudação.
+	if s.firstMessagePrimed && !s.firstOutputAudioReceived.Load() && time.Since(s.startedTime) < 2500*time.Millisecond {
+		pcm24k = make([]byte, len(pcm24k))
 	}
 	s.lastAudioAt.Store(time.Now().UnixMilli())
 	b64 := base64.StdEncoding.EncodeToString(pcm24k)
@@ -504,7 +587,7 @@ func (s *openAILiveSession) SendText(text string) error {
 	}
 	// Se ainda não há áudio do microfone/telefonia chegando, avança imediatamente o relógio de áudio do GPT-Live
 	if time.Since(time.UnixMilli(s.lastAudioAt.Load())) >= 100*time.Millisecond {
-		s.primeAudioClock()
+		s.primeAudioClock(6)
 	}
 	return nil
 }
@@ -540,6 +623,9 @@ func (s *openAILiveSession) Close() error {
 	}
 	if s.speechTimer != nil {
 		s.speechTimer.Stop()
+	}
+	if s.firstMsgRetryTimer != nil {
+		s.firstMsgRetryTimer.Stop()
 	}
 	s.mu.Unlock()
 	_ = s.writeJSON(map[string]string{"type": "session.close"})
@@ -596,10 +682,11 @@ func (s *openAILiveSession) dispatch(data []byte) {
 					if !s.agentSpeaking.Load() {
 						return
 					}
-					if s.silentTailSent.Add(1) > 2 {
+					if s.silentTailSent.Add(1) > 12 {
 						return
 					}
 				} else {
+					s.firstOutputAudioReceived.Store(true)
 					s.silentTailSent.Store(0)
 					s.agentSpeaking.Store(true)
 					s.lastOutputAt.Store(time.Now().UnixMilli())
@@ -610,7 +697,7 @@ func (s *openAILiveSession) dispatch(data []byte) {
 				if s.turnTimer != nil {
 					s.turnTimer.Stop()
 				}
-				s.turnTimer = time.AfterFunc(550*time.Millisecond, func() {
+				s.turnTimer = time.AfterFunc(650*time.Millisecond, func() {
 					s.agentSpeaking.Store(false)
 					s.mu.Lock()
 					cl := s.closed
@@ -691,14 +778,18 @@ func (s *openAILiveSession) dispatch(data []byte) {
 // ============================================================================
 
 type openAISession struct {
-	conn               *websocket.Conn
-	events             chan voice.Event
-	writeMu            sync.Mutex
-	mu                 sync.Mutex
-	closed             bool
-	firstMessagePrimed bool
-	prevInSample       int32
-	hasPrevSample      bool
+	conn                     *websocket.Conn
+	events                   chan voice.Event
+	updatedCh                chan struct{}
+	updatedOnce              sync.Once
+	writeMu                  sync.Mutex
+	mu                       sync.Mutex
+	closed                   bool
+	firstMessagePrimed       bool
+	startedTime              time.Time
+	firstOutputAudioReceived atomic.Bool
+	prevInSample             int32
+	hasPrevSample            bool
 }
 
 func (s *openAISession) FirstMessagePrimed() bool { return s.firstMessagePrimed }
@@ -769,6 +860,9 @@ func (s *openAISession) SendAudio(pcm16k []byte) error {
 	s.mu.Unlock()
 	if len(pcm24k) == 0 {
 		return nil
+	}
+	if s.firstMessagePrimed && !s.firstOutputAudioReceived.Load() && time.Since(s.startedTime) < 2500*time.Millisecond {
+		pcm24k = make([]byte, len(pcm24k))
 	}
 	b64 := base64.StdEncoding.EncodeToString(pcm24k)
 	return s.writeJSON(map[string]string{
@@ -850,6 +944,13 @@ func (s *openAISession) dispatch(data []byte) {
 	}
 
 	switch base.Type {
+	case "session.updated":
+		s.updatedOnce.Do(func() {
+			if s.updatedCh != nil {
+				close(s.updatedCh)
+			}
+		})
+
 	case "response.output_audio.delta", "response.audio.delta":
 		var ev struct {
 			Delta string `json:"delta"`
@@ -857,6 +958,7 @@ func (s *openAISession) dispatch(data []byte) {
 		if json.Unmarshal(data, &ev) == nil && ev.Delta != "" {
 			raw, err := base64.StdEncoding.DecodeString(ev.Delta)
 			if err == nil {
+				s.firstOutputAudioReceived.Store(true)
 				s.events <- voice.Event{Type: voice.EventAudio, Audio: raw}
 			}
 		}

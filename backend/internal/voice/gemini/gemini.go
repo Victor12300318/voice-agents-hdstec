@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"google.golang.org/genai"
 
@@ -138,12 +140,13 @@ func (p *Provider) Connect(ctx context.Context, cfg voice.SessionConfig) (voice.
 	if err != nil {
 		return nil, fmt.Errorf("gemini live connect: %w", err)
 	}
-	sess := &session{s: s, events: make(chan voice.Event, 256)}
+	sess := &session{s: s, events: make(chan voice.Event, 256), startedTime: time.Now()}
 	go sess.readLoop()
 	if fm := strings.TrimSpace(cfg.FirstMessage); fm != "" {
+		sess.firstMessagePrimed = true
 		instruction := fmt.Sprintf("ATENÇÃO (PRIMEIRO TURNO DA LIGAÇÃO): Diga agora APENAS e EXATAMENTE a seguinte frase de saudação e aguarde em silêncio o cliente responder (NÃO fale a apresentação da empresa ainda neste turno):\n%q", fm)
-		if err := sess.SendText(instruction); err == nil {
-			sess.firstMessagePrimed = true
+		if err := sess.SendText(instruction); err != nil {
+			sess.firstMessagePrimed = false
 		}
 	}
 	return sess, nil
@@ -193,14 +196,19 @@ type session struct {
 	s      *genai.Session
 	events chan voice.Event
 
-	mu                 sync.Mutex
-	closed             bool
-	firstMessagePrimed bool
+	mu                       sync.Mutex
+	closed                   bool
+	firstMessagePrimed       bool
+	startedTime              time.Time
+	firstOutputAudioReceived atomic.Bool
 }
 
 func (s *session) FirstMessagePrimed() bool { return s.firstMessagePrimed }
 
 func (s *session) SendAudio(pcm []byte) error {
+	if s.firstMessagePrimed && !s.firstOutputAudioReceived.Load() && time.Since(s.startedTime) < 2500*time.Millisecond {
+		pcm = make([]byte, len(pcm))
+	}
 	return s.s.SendRealtimeInput(genai.LiveRealtimeInput{
 		Audio: &genai.Blob{Data: pcm, MIMEType: "audio/pcm;rate=16000"},
 	})
@@ -263,6 +271,7 @@ func (s *session) dispatch(msg *genai.LiveServerMessage) {
 		if sc.ModelTurn != nil {
 			for _, part := range sc.ModelTurn.Parts {
 				if part.InlineData != nil && len(part.InlineData.Data) > 0 {
+					s.firstOutputAudioReceived.Store(true)
 					s.events <- voice.Event{Type: voice.EventAudio, Audio: part.InlineData.Data}
 				}
 			}

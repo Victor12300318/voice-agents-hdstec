@@ -123,6 +123,51 @@ func (m *MCPSession) applyHeaders(req *http.Request, accept string) {
 	}
 }
 
+type cachedMCPToolList struct {
+	tools     []MCPToolDef
+	transport string
+	expiresAt time.Time
+}
+
+var (
+	mcpCacheMu       sync.RWMutex
+	mcpToolListCache = make(map[string]cachedMCPToolList)
+)
+
+func mcpToolCacheKey(tool store.Tool, targetURL string) string {
+	return tool.ID + "|" + strings.ToUpper(strings.TrimSpace(tool.Config.Transport)) + "|" + targetURL
+}
+
+func storeCachedMCPTools(tool store.Tool, targetURL, transport string, list []MCPToolDef) {
+	if len(list) == 0 || targetURL == "" {
+		return
+	}
+	copied := make([]MCPToolDef, len(list))
+	copy(copied, list)
+	mcpCacheMu.Lock()
+	mcpToolListCache[mcpToolCacheKey(tool, targetURL)] = cachedMCPToolList{
+		tools:     copied,
+		transport: transport,
+		expiresAt: time.Now().Add(10 * time.Minute),
+	}
+	mcpCacheMu.Unlock()
+}
+
+func loadCachedMCPTools(tool store.Tool, targetURL string) ([]MCPToolDef, string, bool) {
+	if targetURL == "" {
+		return nil, "", false
+	}
+	mcpCacheMu.RLock()
+	entry, ok := mcpToolListCache[mcpToolCacheKey(tool, targetURL)]
+	mcpCacheMu.RUnlock()
+	if !ok || time.Now().After(entry.expiresAt) || len(entry.tools) == 0 {
+		return nil, "", false
+	}
+	copied := make([]MCPToolDef, len(entry.tools))
+	copy(copied, entry.tools)
+	return copied, entry.transport, true
+}
+
 // ConnectMCPSession estabelece a sessão MCP (auto-detectando Streamable HTTP vs Legacy SSE)
 // e lista todas as ferramentas expostas pelo servidor via tools/list.
 func ConnectMCPSession(ctx context.Context, httpClient *http.Client, tool store.Tool, vars map[string]string) (*MCPSession, []MCPToolDef, error) {
@@ -139,7 +184,10 @@ func ConnectMCPSession(ctx context.Context, httpClient *http.Client, tool store.
 		pending:    make(map[string]chan rpcMessage),
 	}
 
-	if err := sess.connect(ctx); err != nil {
+	sess.reconnectMu.Lock()
+	err := sess.connect(ctx)
+	sess.reconnectMu.Unlock()
+	if err != nil {
 		sess.Close()
 		return nil, nil, err
 	}
@@ -150,7 +198,38 @@ func ConnectMCPSession(ctx context.Context, httpClient *http.Client, tool store.
 		return nil, nil, err
 	}
 
+	storeCachedMCPTools(tool, targetURL, sess.transport, toolsList)
 	return sess, toolsList, nil
+}
+
+// ConnectOrWarmMCPSession retorna imediatamente as definições de tools em cache (0ms no início da chamada)
+// enquanto abre a sessão MCP em background; se ainda não houver cache, conecta de forma síncrona.
+func ConnectOrWarmMCPSession(ctx context.Context, httpClient *http.Client, tool store.Tool, vars map[string]string) (*MCPSession, []MCPToolDef, error) {
+	targetURL := resolveMCPTargetURL(tool, vars)
+	if targetURL == "" {
+		return nil, nil, errors.New("URL do servidor MCP não configurada")
+	}
+	if cachedTools, cachedTransport, ok := loadCachedMCPTools(tool, targetURL); ok {
+		sess := &MCPSession{
+			tool:       tool,
+			vars:       vars,
+			httpClient: streamSafeHTTPClient(httpClient),
+			targetURL:  targetURL,
+			transport:  cachedTransport,
+			pending:    make(map[string]chan rpcMessage),
+		}
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			sess.reconnectMu.Lock()
+			defer sess.reconnectMu.Unlock()
+			if !sess.closed.Load() && sess.connEpoch.Load() == 0 {
+				_ = sess.connect(bgCtx)
+			}
+		}()
+		return sess, cachedTools, nil
+	}
+	return ConnectMCPSession(ctx, httpClient, tool, vars)
 }
 
 func (m *MCPSession) TransportUsed() string {
@@ -799,6 +878,25 @@ func (m *MCPSession) CallTool(ctx context.Context, remoteToolName string, args m
 	params := map[string]any{
 		"name":      remoteToolName,
 		"arguments": args,
+	}
+
+	if m.connEpoch.Load() == 0 {
+		m.reconnectMu.Lock()
+		initErr := error(nil)
+		if m.connEpoch.Load() == 0 {
+			initErr = m.connect(ctx)
+		}
+		m.reconnectMu.Unlock()
+		if initErr != nil {
+			ms := int(time.Since(start).Milliseconds())
+			errMsg := fmt.Sprintf("MCP connect (%s) falhou: %v", remoteToolName, initErr)
+			return ExecutionResult{
+				Status:       "error",
+				Result:       map[string]any{"success": false, "error": errMsg},
+				DurationMS:   ms,
+				ErrorMessage: errMsg,
+			}
+		}
 	}
 
 	epochBefore := m.connEpoch.Load()

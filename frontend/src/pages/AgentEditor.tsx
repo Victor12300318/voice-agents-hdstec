@@ -756,9 +756,6 @@ export default function AgentEditor() {
 
   const startLiveTest = async () => {
     if (!id || !form) return
-    if (hasUnsavedDraft) {
-      await saveDraft()
-    }
     setIsTestDrawerOpen(true)
     stopAudioResources()
     setTranscripts([])
@@ -768,9 +765,10 @@ export default function AgentEditor() {
     setCallStatus('connecting')
 
     try {
+      // Inicializa e desbloqueia o AudioContext sincronamente dentro do gesto de clique antes de qualquer await
       const player = new AudioPlayer()
       player.init(24000)
-      await player.resume()
+      const resumePromise = player.resume()
       player.onSpeakingChange = (speaking) => {
         setIsAgentSpeaking(speaking)
         if (recorderRef.current && antiEcho) {
@@ -778,6 +776,11 @@ export default function AgentEditor() {
         }
       }
       playerRef.current = player
+
+      if (hasUnsavedDraft) {
+        await saveDraft()
+      }
+      await resumePromise
 
       let wsReady = false
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -799,11 +802,16 @@ export default function AgentEditor() {
             rec.stop()
             return
           }
+          rec.setMuted(antiEcho && player.isPlaying() ? true : isMicMuted)
           recorderRef.current = rec
         })
         .catch(() => {})
 
       ws.onmessage = async (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          player.playChunk(event.data)
+          return
+        }
         if (typeof event.data === 'string') {
           try {
             const data = JSON.parse(event.data)
@@ -814,11 +822,12 @@ export default function AgentEditor() {
                 setCallDuration((d) => d + 1)
               }, 1000)
               await micInitPromise
-              if (!recorderRef.current) {
+              if (!recorderRef.current && wsRef.current === ws) {
                 const fallbackRec = new AudioRecorder((pcm) => {
                   if (ws.readyState === WebSocket.OPEN) ws.send(pcm)
                 })
                 await fallbackRec.start(data.input_sample_rate || 16000)
+                fallbackRec.setMuted(antiEcho && player.isPlaying() ? true : isMicMuted)
                 recorderRef.current = fallbackRec
               }
             } else if (data.type === 'caller_transcript' && data.text) {
@@ -892,8 +901,6 @@ export default function AgentEditor() {
               endLiveTest()
             }
           } catch {}
-        } else if (event.data instanceof ArrayBuffer) {
-          player.playChunk(event.data)
         }
       }
 

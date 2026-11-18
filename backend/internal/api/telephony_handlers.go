@@ -56,7 +56,13 @@ func (s *Server) handleJambonzWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, rejectApp)
 		return
 	} else {
-		s.Runtime.PrefetchInitiation(req.CallSid, agent.ID, req.From, req.To, cfg)
+		if s.Runtime != nil {
+			if prov, pErr := s.Voices.Get(cfg.Provider); pErr == nil {
+				s.Runtime.PrewarmCall(req.CallSid, phone.OrganizationID, agent.ID, req.From, req.To, cfg, prov)
+			} else {
+				s.Runtime.PrefetchInitiation(req.CallSid, agent.ID, req.From, req.To, cfg)
+			}
+		}
 		baseWS := s.resolveBaseWSURL(r)
 
 		audioWSURL := fmt.Sprintf("%s/ws/telephony/jambonz/audio?call_sid=%s&did=%s&from=%s&agent_id=%s&org_id=%s",
@@ -193,7 +199,13 @@ func (s *Server) handleTwilioWebhook(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(twiml))
 		return
 	}
-	s.Runtime.PrefetchInitiation(callSid, agent.ID, from, to, cfg)
+	if s.Runtime != nil {
+		if prov, pErr := s.Voices.Get(cfg.Provider); pErr == nil {
+			s.Runtime.PrewarmCall(callSid, phone.OrganizationID, agent.ID, from, to, cfg, prov)
+		} else {
+			s.Runtime.PrefetchInitiation(callSid, agent.ID, from, to, cfg)
+		}
+	}
 
 	baseWS := s.resolveBaseWSURL(r)
 	audioWSURL := fmt.Sprintf("%s/ws/telephony/twilio/audio", baseWS)

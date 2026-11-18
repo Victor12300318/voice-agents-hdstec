@@ -262,6 +262,9 @@ export class AudioPlayer {
 
   playChunk(pcm16Bytes: ArrayBuffer) {
     if (!this.audioCtx) return
+    if (this.audioCtx.state === 'suspended') {
+      this.audioCtx.resume().catch(() => {})
+    }
 
     const int16 = new Int16Array(pcm16Bytes)
     if (int16.length === 0) return
