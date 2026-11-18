@@ -53,6 +53,7 @@ type SessionConfig struct {
 	Voice           string
 	Language        string
 	SystemPrompt    string
+	VoicePrompt     string
 	FirstMessage    string
 	ThinkingLevel   string // "low" | "medium" | "high"
 	Tools           []ToolSpec

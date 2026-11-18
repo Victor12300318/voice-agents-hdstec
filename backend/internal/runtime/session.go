@@ -347,17 +347,23 @@ func (rt *Runtime) prepareSession(
 		}
 	}
 
+	baseVoicePrompt := systemPrompt
+
 	if len(ps.entryProcedures) > 0 {
 		var triggerIndex strings.Builder
+		var compactVoiceProcs strings.Builder
 		var procNamesList []string
 		triggerIndex.WriteString("## PROCEDIMENTOS E GATILHOS OBRIGATÓRIOS DO AGENTE (PRIORIDADE MÁXIMA SOBRE O PROMPT GERAL):\n")
 		triggerIndex.WriteString("ATENÇÃO CRÍTICA: Os procedimentos abaixo têm precedência absoluta sobre quaisquer instruções gerais ou seções '# Actions' do prompt. Sempre que a fala do cliente acionar o gatilho (Trigger) de um procedimento abaixo (por exemplo: falar em nome de terceiro/familiar como marido, esposa, mãe, filho ou dependente; pedir segunda via de boleto/fatura; ou informar CPF), você DEVE seguir estritamente as regras e perguntas obrigatórias desse procedimento na ordem exata:\n")
+		compactVoiceProcs.WriteString("\n\n## RESUMO DE PROCEDIMENTOS E COLETA DE DADOS:\nQuando o assunto do cliente corresponder a um procedimento abaixo, colete o dado inicial necessário (ex: CPF ou confirmação de titular/terceiro) e gere <|SpawnThinking|> imediatamente assim que o cliente informar os dados:\n")
 		for _, p := range ps.entryProcedures {
 			procNamesList = append(procNamesList, fmt.Sprintf("%q (%s)", p.Name, p.Trigger))
 			triggerIndex.WriteString(fmt.Sprintf("\n### PROCEDIMENTO: %q\n- **Quando acionar (Trigger):** %s\n", p.Name, p.Trigger))
+			var bodyForVoice string
 			if expanded, expErr := procExpander.ExpandProcedure(ctx, orgID, agentID, p, ps.procsMap); expErr == nil && strings.TrimSpace(expanded.ExpandedContent) != "" {
 				triggerIndex.WriteString(expanded.ExpandedContent)
 				triggerIndex.WriteString("\n")
+				bodyForVoice = strings.TrimSpace(expanded.ExpandedContent)
 				for tName, ok := range expanded.AllowedTools {
 					if ok {
 						ps.promptReferencedTools[tName] = true
@@ -366,7 +372,10 @@ func (rt *Runtime) prepareSession(
 			} else if strings.TrimSpace(p.Content) != "" {
 				triggerIndex.WriteString(p.Content)
 				triggerIndex.WriteString("\n")
+				bodyForVoice = strings.TrimSpace(p.Content)
 			}
+			bodyForVoice = truncateRunes(bodyForVoice, 450)
+			compactVoiceProcs.WriteString(fmt.Sprintf("- **%s** (Gatilho: %s): %s\n", p.Name, p.Trigger, bodyForVoice))
 		}
 		for _, p := range ps.activeProcedures {
 			if referencedAsSubProc[p.ID] {
@@ -374,6 +383,8 @@ func (rt *Runtime) prepareSession(
 				if expanded, expErr := procExpander.ExpandProcedure(ctx, orgID, agentID, p, ps.procsMap); expErr == nil && strings.TrimSpace(expanded.ExpandedContent) != "" {
 					triggerIndex.WriteString(expanded.ExpandedContent)
 					triggerIndex.WriteString("\n")
+					subBody := truncateRunes(strings.TrimSpace(expanded.ExpandedContent), 350)
+					compactVoiceProcs.WriteString(fmt.Sprintf("- **%s**: %s\n", p.Name, subBody))
 					for tName, ok := range expanded.AllowedTools {
 						if ok {
 							ps.promptReferencedTools[tName] = true
@@ -384,6 +395,7 @@ func (rt *Runtime) prepareSession(
 		}
 		// Posiciona os procedimentos no TOPO do systemPrompt para garantir precedência sem duplicar tokens
 		systemPrompt = triggerIndex.String() + "\n\n---\n\n" + systemPrompt + "\n\n[Lembrete: siga estritamente os procedimentos obrigatórios no topo deste prompt sempre que seus gatilhos forem acionados.]"
+		baseVoicePrompt += compactVoiceProcs.String()
 
 		ps.toolSpecs = append(ps.toolSpecs, voice.ToolSpec{
 			Name:        "ativar_procedure",
@@ -395,7 +407,7 @@ func (rt *Runtime) prepareSession(
 	}
 
 	mcpSummaryLines := rt.bindAgentToolsAndMCP(
-		ctx, orgID, convIDForVars, addDeferred, cfg.Tools, cfg.SystemPrompt, ps.activeProcedures, ps.procsMap, ps.allVars,
+		ctx, orgID, convIDForVars, addDeferred, cfg.Tools, ps.promptReferencedTools, cfg.SystemPrompt, ps.activeProcedures, ps.procsMap, ps.allVars,
 		&ps.toolSpecs, ps.registeredTools, ps.mcpSessions, ps.mcpBindings,
 	)
 	if len(mcpSummaryLines) > 0 {
@@ -418,6 +430,7 @@ func (rt *Runtime) prepareSession(
 		Voice:           cfg.Voice,
 		Language:        cfg.Language,
 		SystemPrompt:    systemPrompt,
+		VoicePrompt:     baseVoicePrompt,
 		FirstMessage:    firstMessage,
 		ThinkingLevel:   "",
 		Tools:           ps.toolSpecs,
@@ -1112,6 +1125,14 @@ func (rt *Runtime) RunSessionWithOptions(
 							remPlay = 0
 						}
 						silenceWait := remPlay + 13*time.Second
+						if strings.Contains(spokenInTurn, "verificar") ||
+							strings.Contains(spokenInTurn, "consultar") ||
+							strings.Contains(spokenInTurn, "um instante") ||
+							strings.Contains(spokenInTurn, "um momento") ||
+							strings.Contains(spokenInTurn, "já te retorno") ||
+							strings.Contains(spokenInTurn, "aguarde") {
+							silenceWait = remPlay + 28*time.Second
+						}
 						silenceTimer = time.AfterFunc(silenceWait, func() {
 							if callEnding.Load() || sessionCtx.Err() != nil {
 								return
@@ -1272,9 +1293,14 @@ func (rt *Runtime) RunSessionWithOptions(
 					if ev.ToolCall == nil {
 						continue
 					}
+					guardianMu.Lock()
+					if silenceTimer != nil {
+						silenceTimer.Stop()
+					}
+					guardianMu.Unlock()
 					fc := *ev.ToolCall
 					_ = sendJSON(serverMessage{Type: "tool_call", Text: fc.Name})
-					_ = rt.Store.RecordEvent(sessionCtx, orgID, conv.ID, "tool_call", map[string]any{
+					recordEventAsync("tool_call", map[string]any{
 						"id": fc.ID, "name": fc.Name, "args": fc.Args,
 					})
 
@@ -1607,7 +1633,7 @@ func (rt *Runtime) RunSessionWithOptions(
 						}
 
 						childMCPLines := rt.bindAgentToolsAndMCP(
-							sessionCtx, orgID, conv.ID, recordEventAsync, targetCfg.Tools, targetCfg.SystemPrompt, newActiveProcedures, newProcsMap, allVars,
+							sessionCtx, orgID, conv.ID, recordEventAsync, targetCfg.Tools, nil, targetCfg.SystemPrompt, newActiveProcedures, newProcsMap, allVars,
 							&childToolSpecs, newRegisteredTools, newMCPSessions, newMCPBindings,
 						)
 						if len(childMCPLines) > 0 {
@@ -2215,11 +2241,63 @@ type mcpToolBinding struct {
 	Session        *tools.MCPSession
 }
 
+func truncateRunes(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "..."
+}
+
+func deriveWebhookToolParams(t store.Tool) []voice.Param {
+	if len(t.InputSchema) > 0 {
+		return t.InputSchema
+	}
+	if t.Config.APISchema == nil {
+		return nil
+	}
+	var out []voice.Param
+	seen := make(map[string]bool)
+	addParam := func(ps store.ToolParamSchema, forceReq bool) {
+		name := strings.TrimSpace(ps.Name)
+		if name == "" || seen[name] {
+			return
+		}
+		if ps.ValueType != "" && ps.ValueType != "llm_prompt" {
+			return
+		}
+		seen[name] = true
+		typ := strings.TrimSpace(ps.Type)
+		if typ == "" {
+			typ = "string"
+		}
+		out = append(out, voice.Param{
+			Name:        name,
+			Type:        typ,
+			Description: ps.Description,
+			Required:    forceReq || ps.Required,
+		})
+	}
+	for _, pp := range t.Config.APISchema.PathParamsSchema {
+		addParam(pp, true)
+	}
+	for _, qp := range t.Config.APISchema.QueryParamsSchema {
+		addParam(qp, false)
+	}
+	if t.Config.APISchema.RequestBodySchema != nil {
+		for _, bp := range t.Config.APISchema.RequestBodySchema.Properties {
+			addParam(bp, false)
+		}
+	}
+	return out
+}
+
 func (rt *Runtime) bindAgentToolsAndMCP(
 	ctx context.Context,
 	orgID, convID string,
 	onEvent func(evType string, payload any),
 	cfgToolIDs []string,
+	promptReferencedTools map[string]bool,
 	rawPrompt string,
 	activeProcedures []store.ProcedureSnapshot,
 	procsMap map[string]store.ProcedureSnapshot,
@@ -2249,7 +2327,7 @@ func (rt *Runtime) bindAgentToolsAndMCP(
 
 	collectTool := func(ref string) {
 		ref = strings.TrimSpace(ref)
-		if ref == "" || addedToolIDs[ref] {
+		if ref == "" || addedToolIDs[ref] || rt.Store == nil {
 			return
 		}
 		var t store.Tool
@@ -2264,18 +2342,30 @@ func (rt *Runtime) bindAgentToolsAndMCP(
 		}
 		addedToolIDs[ref] = true
 		addedToolIDs[t.ID] = true
+		addedToolIDs[strings.ToLower(t.Name)] = true
 		orderedTools = append(orderedTools, t)
 	}
 
 	for _, toolID := range cfgToolIDs {
 		collectTool(toolID)
 	}
+	for tName, ok := range promptReferencedTools {
+		if ok {
+			collectTool(tName)
+		}
+	}
 	for _, ref := range procedures.ParseReferences(rawPrompt) {
 		if ref.Kind == "tool" {
 			collectTool(ref.ID)
 		}
 	}
+	var combinedCorpus strings.Builder
+	combinedCorpus.WriteString(strings.ToLower(rawPrompt))
 	for _, p := range activeProcedures {
+		combinedCorpus.WriteString("\n")
+		combinedCorpus.WriteString(strings.ToLower(p.Trigger))
+		combinedCorpus.WriteString("\n")
+		combinedCorpus.WriteString(strings.ToLower(p.Content))
 		meta := procedures.InspectProcedure(store.Procedure{
 			ID:      p.ID,
 			Name:    p.Name,
@@ -2285,6 +2375,27 @@ func (rt *Runtime) bindAgentToolsAndMCP(
 		}, procsMap, nil, nil)
 		for _, refToolID := range meta.ReferencedToolIDs {
 			collectTool(refToolID)
+		}
+	}
+
+	// Também vincula automaticamente qualquer Tool/MCP ativa da organização cujo nome ou ID apareça
+	// explicitamente no prompt ou nos procedimentos ativos (ex.: @MCPNac_Ativo, MCPNac_Ativo, consultar_cpf).
+	if rt.Store != nil {
+		corpusStr := combinedCorpus.String()
+		if orgTools, listErr := rt.Store.ListTools(ctx, orgID); listErr == nil {
+			for _, ot := range orgTools {
+				if !ot.Active || addedToolIDs[ot.ID] {
+					continue
+				}
+				nameLower := strings.ToLower(strings.TrimSpace(ot.Name))
+				idLower := strings.ToLower(strings.TrimSpace(ot.ID))
+				if (len(nameLower) >= 3 && strings.Contains(corpusStr, nameLower)) ||
+					(idLower != "" && strings.Contains(corpusStr, idLower)) {
+					addedToolIDs[ot.ID] = true
+					addedToolIDs[nameLower] = true
+					orderedTools = append(orderedTools, ot.Tool)
+				}
+			}
 		}
 	}
 
@@ -2390,7 +2501,7 @@ func (rt *Runtime) bindAgentToolsAndMCP(
 		*toolSpecs = append(*toolSpecs, voice.ToolSpec{
 			Name:        fnName,
 			Description: t.Description,
-			Parameters:  t.InputSchema,
+			Parameters:  deriveWebhookToolParams(t),
 		})
 		registeredTools[fnName] = t
 	}

@@ -105,14 +105,16 @@ const FALLBACK_CATALOGS: ProviderCatalog[] = [
       { id: 'gpt-realtime-1.5', label: 'GPT Realtime 1.5', description: 'Versão 1.5' },
     ],
     delegation_models: [
-      { id: 'gpt-4.1-mini', label: 'GPT-4.1 Mini', description: 'Padrão equilibrado — rápido e preciso para ferramentas e procedimentos', default: true },
-      { id: 'gpt-4.1-nano', label: 'GPT-4.1 Nano', description: 'Ultra-rápido e econômico — menor latência na execução de tarefas' },
-      { id: 'gpt-4.1', label: 'GPT-4.1', description: 'Máxima precisão para regras complexas e múltiplos procedimentos' },
-      { id: 'gpt-4o-mini', label: 'GPT-4o Mini', description: 'Leve e rápido para fluxos simples' },
-      { id: 'gpt-4o', label: 'GPT-4o', description: 'Modelo completo para raciocínio geral' },
-      { id: 'gpt-5-mini', label: 'GPT-5 Mini', description: 'Nova geração equilibrada para tarefas e ferramentas' },
-      { id: 'gpt-5-nano', label: 'GPT-5 Nano', description: 'Nova geração ultra-rápida e econômica' },
-      { id: 'gpt-5', label: 'GPT-5', description: 'Nova geração com máxima capacidade de raciocínio' },
+      { id: 'gpt-6-luna', label: 'GPT-6 Luna', description: 'Recomendado pela OpenAI para GPT-Live — ultra-rápido e econômico para tools e procedimentos', default: true },
+      { id: 'gpt-6.2-sol', label: 'GPT-6.2 Sol', description: 'Equilíbrio ideal entre inteligência e velocidade para agentes em escala' },
+      { id: 'gpt-6-sol', label: 'GPT-6 Sol', description: 'Especializado em fluxos agênticos complexos e múltiplas ferramentas' },
+      { id: 'gpt-6.1-terra', label: 'GPT-6.1 Terra', description: 'Rápido e preciso para procedimentos estruturados' },
+      { id: 'gpt-6.2-astra', label: 'GPT-6.2 Astra', description: 'Máxima capacidade de raciocínio para regras críticas' },
+      { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna', description: 'Baixa latência otimizado para alto volume (série 5.6)' },
+      { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra', description: 'Equilibrado em inteligência e custo (série 5.6)' },
+      { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini', description: 'Modelo Mini ágil para subagentes e chamada de ferramentas' },
+      { id: 'gpt-5.4', label: 'GPT-5.4', description: 'Modelo completo série 5.4' },
+      { id: 'gpt-4.1-mini', label: 'GPT-4.1 Mini (Legado)', description: 'Compatibilidade com projetos legados' },
     ],
     voices: [
       { id: 'bossa', label: 'Bossa (PT-BR)', default: true },
@@ -1594,7 +1596,7 @@ export default function AgentEditor() {
                         </span>
                         {form.model.startsWith('gpt-live') && (
                           <span className="block text-[11px] text-zinc-500 mt-0.5 truncate">
-                            Tarefas: {form.system_tools_config?.delegation_model || 'gpt-4.1-mini'}
+                            Tarefas: {form.system_tools_config?.delegation_model || 'gpt-6-luna'}
                           </span>
                         )}
                       </div>
@@ -2533,7 +2535,7 @@ export default function AgentEditor() {
                     []
                   ).map((dm) => {
                     const activeDelegation =
-                      form.system_tools_config?.delegation_model || 'gpt-4.1-mini'
+                      form.system_tools_config?.delegation_model || 'gpt-6-luna'
                     const isSelected = activeDelegation === dm.id
                     return (
                       <button
@@ -2576,7 +2578,7 @@ export default function AgentEditor() {
                       type="text"
                       value={customDelegationModel}
                       onChange={(e) => setCustomDelegationModel(e.target.value)}
-                      placeholder="ex: gpt-4.1-mini, gpt-5-mini, o4-mini"
+                      placeholder="ex: gpt-6-luna, gpt-6.2-sol, gpt-5.6-luna"
                       className="flex-1 px-3 py-1.5 bg-white border border-zinc-200 rounded-xl font-mono text-xs text-zinc-900 focus:outline-none focus:border-zinc-400"
                     />
                     <Button

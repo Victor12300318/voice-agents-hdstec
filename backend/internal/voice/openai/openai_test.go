@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"voiceagent/internal/voice"
@@ -122,5 +123,29 @@ func TestOpenAILiveDispatchMarksFirstOutputAudio(t *testing.T) {
 	}
 	if sess.turnTimer != nil {
 		sess.turnTimer.Stop()
+	}
+}
+
+func TestOpenAILiveSpawnThinkingPolicyAndModelResolution(t *testing.T) {
+	if got := resolveDelegationModel(""); got != "gpt-6-luna" {
+		t.Fatalf("esperava gpt-6-luna como padrão, veio %s", got)
+	}
+	if got := resolveDelegationModel("gpt-4.1-nano"); got != "gpt-6-luna" {
+		t.Fatalf("esperava redirecionamento de modelo encerrado para gpt-6-luna, veio %s", got)
+	}
+
+	prompt := buildLiveFrontendInstructions(voice.SessionConfig{
+		Language:    "pt-BR",
+		VoicePrompt: "Você é a Lívia da GEAP.",
+		Tools: []voice.ToolSpec{
+			{Name: "consultar_cpf", Description: "Consulta beneficiário pelo CPF"},
+		},
+	}, "Boa tarde, sou a Lívia.")
+
+	if !strings.Contains(prompt, "<|SpawnThinking|>") {
+		t.Fatal("esperava token oficial <|SpawnThinking|> nas instruções do GPT-Live")
+	}
+	if !strings.Contains(prompt, "consultar_cpf") {
+		t.Fatal("esperava ferramenta consultar_cpf listada em Backend tools")
 	}
 }

@@ -269,7 +269,16 @@ func (e *Expander) expandContent(
 			if e.Store == nil {
 				return rawMatch
 			}
-			t, err := e.Store.GetTool(ctx, orgID, id)
+			var t store.Tool
+			var err error
+			if len(id) == 36 && strings.Count(id, "-") == 4 {
+				t, err = e.Store.GetTool(ctx, orgID, id)
+			} else {
+				t, err = e.Store.GetToolByName(ctx, orgID, id)
+				if err != nil {
+					t, err = e.Store.GetTool(ctx, orgID, id)
+				}
+			}
 			if err == nil {
 				allowedTools[t.Name] = true
 				return fmt.Sprintf("[Ferramenta: `%s`]", t.Name)

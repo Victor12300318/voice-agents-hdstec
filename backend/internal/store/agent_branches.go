@@ -712,8 +712,16 @@ func (s *Store) RouteVersionForConversation(ctx context.Context, orgID string, a
 			}
 			if chosen != nil && chosen.HeadVersionID != nil {
 				if ver, err := s.GetVersionByRef(ctx, orgID, ag.ID, *chosen.HeadVersionID); err == nil {
-					if draftCfg, dErr := s.DraftConfig(ctx, orgID, ag); dErr == nil && len(draftCfg.Procedures) > 0 {
-						ver.Snapshot.Procedures = draftCfg.Procedures
+					if draftCfg, dErr := s.DraftConfig(ctx, orgID, ag); dErr == nil {
+						if len(draftCfg.Procedures) > 0 {
+							ver.Snapshot.Procedures = draftCfg.Procedures
+						}
+						if len(ver.Snapshot.Tools) == 0 && len(draftCfg.Tools) > 0 {
+							ver.Snapshot.Tools = draftCfg.Tools
+						}
+						if ver.Snapshot.SystemToolsConfig.DelegationModel == "" && draftCfg.SystemToolsConfig.DelegationModel != "" {
+							ver.Snapshot.SystemToolsConfig.DelegationModel = draftCfg.SystemToolsConfig.DelegationModel
+						}
 					}
 					bID := chosen.ID
 					return ver.Snapshot, &ver.ID, &bID, nil
@@ -724,8 +732,16 @@ func (s *Store) RouteVersionForConversation(ctx context.Context, orgID string, a
 
 	v, err := s.LatestVersion(ctx, orgID, ag.ID)
 	if err == nil {
-		if draftCfg, dErr := s.DraftConfig(ctx, orgID, ag); dErr == nil && len(draftCfg.Procedures) > 0 {
-			v.Snapshot.Procedures = draftCfg.Procedures
+		if draftCfg, dErr := s.DraftConfig(ctx, orgID, ag); dErr == nil {
+			if len(draftCfg.Procedures) > 0 {
+				v.Snapshot.Procedures = draftCfg.Procedures
+			}
+			if len(v.Snapshot.Tools) == 0 && len(draftCfg.Tools) > 0 {
+				v.Snapshot.Tools = draftCfg.Tools
+			}
+			if v.Snapshot.SystemToolsConfig.DelegationModel == "" && draftCfg.SystemToolsConfig.DelegationModel != "" {
+				v.Snapshot.SystemToolsConfig.DelegationModel = draftCfg.SystemToolsConfig.DelegationModel
+			}
 		}
 		return v.Snapshot, &v.ID, v.BranchID, nil
 	}

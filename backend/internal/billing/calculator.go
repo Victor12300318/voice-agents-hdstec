@@ -31,6 +31,24 @@ func Calculate(provider, model string, usage voice.Usage, durationMS int64) Cost
 	modelLower := strings.ToLower(model)
 	providerLower := strings.ToLower(provider)
 
+	// GPT-Live 1: cobrado por segundo ($0.05/min de sessão de voz) + tokens de texto do backend Responses
+	if strings.Contains(modelLower, "gpt-live") {
+		durationMinutes := float64(durationMS) / 60000.0
+		if durationMinutes > 0 {
+			res.OutputAudioCostUSD = durationMinutes * 0.05
+		}
+		if usage.InputTextTokens > 0 || usage.OutputTextTokens > 0 {
+			res.InputTextCostUSD = (float64(usage.InputTextTokens) / 1_000_000.0) * 0.60
+			res.OutputTextCostUSD = (float64(usage.OutputTextTokens) / 1_000_000.0) * 2.40
+			res.Method = "tokens"
+		} else {
+			res.Method = "duration_estimate"
+		}
+		res.TotalCostUSD = res.OutputAudioCostUSD + res.InputTextCostUSD + res.OutputTextCostUSD
+		res.TotalCostBRL = res.TotalCostUSD * DefaultUSDtoBRL
+		return res
+	}
+
 	// Se houver tokens registrados, calcula via tokens exatos
 	if usage.TotalTokens > 0 || usage.InputAudioTokens > 0 || usage.OutputAudioTokens > 0 {
 		switch {
