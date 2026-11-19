@@ -66,8 +66,9 @@ type JambonzTransport struct {
 	apiURL           string
 	apiKey           string
 	outRemainder     []byte
-	inFilterHistory  []int16
-	outFilterHistory []int16
+	inMu             sync.Mutex
+	inDSP            audio.StreamDSP
+	outDSP           audio.StreamDSP
 	writeMu          sync.Mutex
 }
 
@@ -101,7 +102,9 @@ func (t *JambonzTransport) ReadEvent(ctx context.Context) (runtime.TransportEven
 
 	if msgType == websocket.MessageBinary {
 		// Áudio telefônico G.711 μ-law (8kHz) vindo do Jambonz -> converte para PCM16 na taxa de entrada do Provider
-		pcm16 := audio.TelephonyToProviderWithHistory(data, &t.inFilterHistory, t.inputSampleRate)
+		t.inMu.Lock()
+		pcm16 := t.inDSP.InboundMuLawToPCM(data, t.inputSampleRate)
+		t.inMu.Unlock()
 		return runtime.TransportEvent{IsAudio: true, Audio: pcm16}, nil
 	}
 
@@ -127,15 +130,8 @@ func (t *JambonzTransport) SendAudio(ctx context.Context, pcmData []byte) error 
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 
-	alignBytes := 2
-	if t.outputSampleRate == 24000 {
-		alignBytes = 6
-	} else if t.outputSampleRate == 16000 {
-		alignBytes = 4
-	}
-
 	combined := append(t.outRemainder, pcmData...)
-	usableLen := (len(combined) / alignBytes) * alignBytes
+	usableLen := (len(combined) / 2) * 2
 	if usableLen == 0 {
 		t.outRemainder = combined
 		return nil
@@ -143,7 +139,7 @@ func (t *JambonzTransport) SendAudio(ctx context.Context, pcmData []byte) error 
 	toConvert := combined[:usableLen]
 	t.outRemainder = append([]byte(nil), combined[usableLen:]...)
 
-	telephonyAudio := audio.ProviderToTelephonyWithHistory(toConvert, &t.outFilterHistory, t.outputSampleRate)
+	telephonyAudio := t.outDSP.OutboundPCMToMuLaw(toConvert, t.outputSampleRate)
 	if len(telephonyAudio) == 0 {
 		return nil
 	}

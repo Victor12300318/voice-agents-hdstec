@@ -72,3 +72,44 @@ func TestTelephonyPipeline(t *testing.T) {
 		t.Fatalf("ProviderToTelephony 24k->8k: expected 160 bytes, got %d", len(telephonyMuLaw))
 	}
 }
+
+func TestStreamDSPContinuousFramingWithoutBoundaryLoss(t *testing.T) {
+	var dsp StreamDSP
+
+	// 50 pacotes consecutivos de 20ms de G.711 μ-law (1 segundo total) -> 16kHz PCM16
+	totalInBytes := 0
+	for p := 0; p < 50; p++ {
+		pkt := make([]byte, 160)
+		for i := range pkt {
+			val := int16(12000 * math.Sin(2*math.Pi*800*float64(p*160+i)/8000.0))
+			pkt[i] = EncodeMuLawSample(val)
+		}
+		out := dsp.InboundMuLawToPCM(pkt, 16000)
+		totalInBytes += len(out)
+	}
+	if totalInBytes != 50*640 {
+		t.Fatalf("esperava 32000 bytes em 1s de 16kHz PCM16, veio %d", totalInBytes)
+	}
+
+	// 50 pacotes de tamanhos variados somando 24.000 amostras (1s @ 24kHz) -> 8.000 bytes μ-law
+	totalOutMuLaw := 0
+	sampleIdx := 0
+	chunkSizes := []int{481, 479, 480, 480} // testa inclusive tamanhos não múltiplos de 3!
+	for sampleIdx < 24000 {
+		n := chunkSizes[(sampleIdx/100)%len(chunkSizes)]
+		if sampleIdx+n > 24000 {
+			n = 24000 - sampleIdx
+		}
+		buf := make([]byte, n*2)
+		for i := 0; i < n; i++ {
+			val := int16(12000 * math.Sin(2*math.Pi*1000*float64(sampleIdx+i)/24000.0))
+			binary.LittleEndian.PutUint16(buf[i*2:], uint16(val))
+		}
+		sampleIdx += n
+		mu := dsp.OutboundPCMToMuLaw(buf, 24000)
+		totalOutMuLaw += len(mu)
+	}
+	if totalOutMuLaw != 8000 {
+		t.Fatalf("esperava exatamente 8000 bytes μ-law para 1s de 24kHz, veio %d", totalOutMuLaw)
+	}
+}

@@ -107,9 +107,10 @@ type TwilioTransport struct {
 	callSid          string
 	accountSid       string
 	authToken        string
+	inMu             sync.Mutex
+	inDSP            audio.StreamDSP
+	outDSP           audio.StreamDSP
 	outRemainder     []byte
-	inFilterHistory  []int16
-	outFilterHistory []int16
 	mu               sync.RWMutex
 	writeMu          sync.Mutex
 }
@@ -207,7 +208,9 @@ func (t *TwilioTransport) ReadEvent(ctx context.Context) (runtime.TransportEvent
 			if err != nil || len(mulawBytes) == 0 {
 				continue
 			}
-			pcm16 := audio.TelephonyToProviderWithHistory(mulawBytes, &t.inFilterHistory, t.inputSampleRate)
+			t.inMu.Lock()
+			pcm16 := t.inDSP.InboundMuLawToPCM(mulawBytes, t.inputSampleRate)
+			t.inMu.Unlock()
 			return runtime.TransportEvent{IsAudio: true, Audio: pcm16}, nil
 
 		case "stop", "closed":
@@ -224,17 +227,8 @@ func (t *TwilioTransport) SendAudio(ctx context.Context, pcmData []byte) error {
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 
-	// Alinha o buffer de entrada ao fator de decimação (ex: 6 bytes para 24kHz->8kHz, 4 bytes para 16kHz->8kHz)
-	// para nunca perder amostras nas fronteiras entre chunks do WebSocket.
-	alignBytes := 2
-	if t.outputSampleRate == 24000 {
-		alignBytes = 6
-	} else if t.outputSampleRate == 16000 {
-		alignBytes = 4
-	}
-
 	combined := append(t.outRemainder, pcmData...)
-	usableLen := (len(combined) / alignBytes) * alignBytes
+	usableLen := (len(combined) / 2) * 2
 	if usableLen == 0 {
 		t.outRemainder = combined
 		return nil
@@ -242,7 +236,7 @@ func (t *TwilioTransport) SendAudio(ctx context.Context, pcmData []byte) error {
 	toConvert := combined[:usableLen]
 	t.outRemainder = append([]byte(nil), combined[usableLen:]...)
 
-	telephonyAudio := audio.ProviderToTelephonyWithHistory(toConvert, &t.outFilterHistory, t.outputSampleRate)
+	telephonyAudio := t.outDSP.OutboundPCMToMuLaw(toConvert, t.outputSampleRate)
 	if len(telephonyAudio) == 0 {
 		return nil
 	}
@@ -286,7 +280,7 @@ func (t *TwilioTransport) SendMessage(ctx context.Context, msg runtime.ServerMes
 
 		t.writeMu.Lock()
 		t.outRemainder = nil
-		t.outFilterHistory = nil
+		t.outDSP.ResetOutbound()
 		defer t.writeMu.Unlock()
 
 		writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)

@@ -714,6 +714,7 @@ type openAILiveSession struct {
 	silentTailSent           atomic.Int32
 	turnTimer                *time.Timer
 	speechTimer              *time.Timer
+	inRem                    []byte
 	prevInSample             int32
 	hasPrevSample            bool
 }
@@ -830,7 +831,13 @@ func (s *openAILiveSession) TriggerFirstMessage(firstMessage string) error {
 func (s *openAILiveSession) SendAudio(pcm16k []byte) error {
 	s.ensureKeepalive()
 	s.mu.Lock()
-	pcm24k := upsample16to24Stateful(pcm16k, &s.prevInSample, &s.hasPrevSample)
+	combined := append(s.inRem, pcm16k...)
+	usableBytes := (len(combined) / 4) * 4
+	var pcm24k []byte
+	if usableBytes > 0 {
+		pcm24k = upsample16to24Stateful(combined[:usableBytes], &s.prevInSample, &s.hasPrevSample)
+	}
+	s.inRem = append(s.inRem[:0], combined[usableBytes:]...)
 	s.mu.Unlock()
 	if len(pcm24k) == 0 {
 		return nil
@@ -1148,6 +1155,7 @@ type openAISession struct {
 	firstMessagePrimed       bool
 	startedTime              time.Time
 	firstOutputAudioReceived atomic.Bool
+	inRem                    []byte
 	prevInSample             int32
 	hasPrevSample            bool
 }
@@ -1236,7 +1244,13 @@ func (s *openAISession) writeJSON(v any) error {
 
 func (s *openAISession) SendAudio(pcm16k []byte) error {
 	s.mu.Lock()
-	pcm24k := upsample16to24Stateful(pcm16k, &s.prevInSample, &s.hasPrevSample)
+	combined := append(s.inRem, pcm16k...)
+	usableBytes := (len(combined) / 4) * 4
+	var pcm24k []byte
+	if usableBytes > 0 {
+		pcm24k = upsample16to24Stateful(combined[:usableBytes], &s.prevInSample, &s.hasPrevSample)
+	}
+	s.inRem = append(s.inRem[:0], combined[usableBytes:]...)
 	s.mu.Unlock()
 	if len(pcm24k) == 0 {
 		return nil

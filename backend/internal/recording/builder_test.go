@@ -79,3 +79,28 @@ func TestInterruptionTruncate(t *testing.T) {
 		t.Fatalf("esperava 192000 bytes após truncar no segundo 2, veio %d", dataLen)
 	}
 }
+
+func TestCallerTCPBacklogDoesNotCreateLatencyInRecording(t *testing.T) {
+	rec := NewSessionRecorder()
+	t0 := time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC)
+	rec.SetStartTime(t0)
+
+	// Simula 90 pacotes de 20ms (1.8s de backlog TCP) lidos todos de uma vez em t0 + 1.8s
+	tBurst := t0.Add(1800 * time.Millisecond)
+	silent20ms16k := make([]byte, 640) // 320 amostras @ 16kHz -> 480 amostras @ 24kHz (20ms)
+	for i := 0; i < 90; i++ {
+		rec.AddCallerAudioAt(silent20ms16k, tBurst)
+	}
+
+	// Agora o Caller fala exatamente em t0 + 2.0s: a amostra deve cair em ~2.0s (48.000 amostras), não em 3.8s!
+	speech20ms16k := make([]byte, 640)
+	for i := 0; i < 320; i++ {
+		binary.LittleEndian.PutUint16(speech20ms16k[i*2:], uint16(8000))
+	}
+	rec.AddCallerAudioAt(speech20ms16k, t0.Add(2000*time.Millisecond))
+
+	// 2.0s a 24kHz = 48.000 amostras (tolerância máxima de ±1 pacote = 480 amostras)
+	if len(rec.leftSamples) < 47520 || len(rec.leftSamples) > 48480 {
+		t.Fatalf("esperava trilha do Caller alinhada em ~48000 amostras (2.0s), mas ficou em %d", len(rec.leftSamples))
+	}
+}

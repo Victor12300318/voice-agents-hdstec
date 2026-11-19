@@ -70,18 +70,40 @@ func (sr *SessionRecorder) AddCallerAudioAt(pcm16 []byte, at time.Time) {
 
 	s24 := upsample16to24Stateful(s16[:usable], &sr.callerPrevSample, &sr.hasCallerPrev)
 
-	// Só preenche silêncio no início da chamada ou após pausa > 300ms entre envios do Caller
-	offset := int(at.Sub(sr.startedAt).Seconds() * float64(recordingSampleRate))
-	if offset < 0 {
-		offset = 0
+	endOffset := int(at.Sub(sr.startedAt).Seconds() * float64(recordingSampleRate))
+	if endOffset < 0 {
+		endOffset = 0
 	}
-	if len(sr.leftSamples) == 0 || (!sr.lastCallerTime.IsZero() && at.Sub(sr.lastCallerTime) > 300*time.Millisecond) {
-		for len(sr.leftSamples) < offset {
-			sr.leftSamples = append(sr.leftSamples, 0)
+
+	if len(s24) <= 4800 {
+		// Chunks em tempo real (20ms na Twilio = 480 amostras, ~43ms no navegador = 1024 amostras):
+		// Posiciona o término do pacote exatamente em endOffset (início em endOffset - len(s24))
+		// e corrige tanto buracos de perda RTP (>60ms) quanto acúmulo de pacotes no buffer TCP inicial (>40ms),
+		// eliminando o atraso/latência da voz do usuário na gravação estéreo.
+		startOffset := endOffset - len(s24)
+		if startOffset < 0 {
+			startOffset = 0
 		}
+		if len(sr.leftSamples) == 0 || startOffset-len(sr.leftSamples) > 1440 {
+			for len(sr.leftSamples) < startOffset {
+				sr.leftSamples = append(sr.leftSamples, 0)
+			}
+		}
+		sr.leftSamples = append(sr.leftSamples, s24...)
+		if endOffset > 0 && len(sr.leftSamples) > endOffset+960 {
+			excess := len(sr.leftSamples) - endOffset
+			copy(sr.leftSamples, sr.leftSamples[excess:])
+			sr.leftSamples = sr.leftSamples[:endOffset]
+		}
+	} else {
+		if len(sr.leftSamples) == 0 || (!sr.lastCallerTime.IsZero() && at.Sub(sr.lastCallerTime) > 300*time.Millisecond) {
+			for len(sr.leftSamples) < endOffset {
+				sr.leftSamples = append(sr.leftSamples, 0)
+			}
+		}
+		sr.leftSamples = append(sr.leftSamples, s24...)
 	}
 	sr.lastCallerTime = at
-	sr.leftSamples = append(sr.leftSamples, s24...)
 }
 
 func (sr *SessionRecorder) AddAgentAudio(pcm24kHz []byte) {
@@ -214,36 +236,29 @@ func masterCallerTrack24k(in []int16) []int16 {
 		return in
 	}
 
-	// Passo 1: High-Pass (~80 Hz @ 24kHz) + De-Hiss FIR
+	// Passo 1: High-Pass (~80 Hz @ 24kHz) sem borrar os agudos já filtrados pelo DSP polifásico
 	filtered := make([]float64, n)
 	hpAlpha := 0.979 // ~80 Hz em 24000 Hz
-	var prevIn, prevHP float64
+	var prevIn, prevHP, peak float64
 	for i := 0; i < n; i++ {
 		x := float64(in[i])
 		hp := hpAlpha * (prevHP + x - prevIn)
 		prevIn = x
 		prevHP = hp
 		filtered[i] = hp
-	}
-
-	smoothed := make([]float64, n)
-	var peak float64
-	for i := 2; i < n-2; i++ {
-		v := 0.10*filtered[i-2] + 0.24*filtered[i-1] + 0.32*filtered[i] + 0.24*filtered[i+1] + 0.10*filtered[i+2]
-		smoothed[i] = v
-		av := math.Abs(v)
+		av := math.Abs(hp)
 		if av > peak {
 			peak = av
 		}
 	}
 
-	// Passo 2: Calcula ganho automático de normalização (AGC de gravação)
-	targetPeak := 20000.0
+	// Passo 2: Ganho conservador de normalização (máx. 1.8x) para não amplificar ruído de linha
+	targetPeak := 18500.0
 	gain := 1.0
-	if peak > 350.0 && peak < targetPeak {
+	if peak > 450.0 && peak < targetPeak {
 		gain = targetPeak / peak
-		if gain > 3.2 {
-			gain = 3.2
+		if gain > 1.8 {
+			gain = 1.8
 		}
 	}
 
@@ -252,10 +267,10 @@ func masterCallerTrack24k(in []int16) []int16 {
 	var env float64
 	attackCoeff := 0.02
 	releaseCoeff := 0.0008
-	noiseFloor := 85.0
+	noiseFloor := 95.0
 
 	for i := 0; i < n; i++ {
-		absSample := math.Abs(smoothed[i])
+		absSample := math.Abs(filtered[i])
 		if absSample > env {
 			env += attackCoeff * (absSample - env)
 		} else {
@@ -265,10 +280,10 @@ func masterCallerTrack24k(in []int16) []int16 {
 		gate := 1.0
 		if env < noiseFloor {
 			ratio := env / noiseFloor
-			gate = ratio * ratio * 0.25
+			gate = ratio * ratio * 0.20
 		}
 
-		val := smoothed[i] * gain * gate
+		val := filtered[i] * gain * gate
 		if val > 23000.0 {
 			val = 23000.0 + 8500.0*math.Tanh((val-23000.0)/8500.0)
 		} else if val < -23000.0 {
