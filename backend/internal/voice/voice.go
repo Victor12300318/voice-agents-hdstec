@@ -55,27 +55,34 @@ type SkillSummary struct {
 // SessionConfig é tudo que o provider precisa para abrir uma sessão, já resolvido
 // (Variables substituídas, idioma e índice de Procedures embutidos no prompt).
 type SessionConfig struct {
-	AgentName        string
-	Model            string
-	DelegationModel  string
-	ReasoningEffort  string // "none" | "low" | "medium" | "high"
-	Voice            string
-	Language         string
-	SystemPrompt     string
-	VoicePrompt      string
-	SpeakerPrompt    string
-	ReasonerPrompt   string
-	PersonalityPacks []string
-	SkillSummaries   []SkillSummary
-	FirstMessage     string
-	ThinkingLevel    string // "low" | "medium" | "high"
-	Tools            []ToolSpec
+	AgentName         string
+	Model             string
+	DelegationModel   string
+	ReasoningEffort   string // "none" | "low" | "medium" | "high"
+	Voice             string
+	Language          string
+	SystemPrompt      string
+	VoicePrompt       string
+	SpeakerPrompt     string
+	ReasonerPrompt    string
+	PersonalityPacks  []string
+	SkillSummaries    []SkillSummary
+	FirstMessage      string
+	DeferFirstMessage bool
+	ThinkingLevel     string // "low" | "medium" | "high"
+	Tools             []ToolSpec
 }
 
 // FirstMessagePrimer pode ser implementado por uma voice.Session que já dispara
 // a primeira fala imediatamente durante o Connect, evitando round-trip extra no runtime.
 type FirstMessagePrimer interface {
 	FirstMessagePrimed() bool
+}
+
+// FirstMessageStarter permite disparar a primeira mensagem exatamente quando o canal de áudio
+// do Caller (WebSocket ou RTP/Twilio) já está aberto e escutando eventos.
+type FirstMessageStarter interface {
+	TriggerFirstMessage(firstMessage string) error
 }
 
 // ToolSpec é a declaração provider-agnóstica de uma função chamável pelo modelo.

@@ -189,6 +189,7 @@ export default function AgentTest() {
             switch (msg.type) {
               case 'ready':
                 wsReady = true
+                void player.resume()
                 if (!player.isPlaying()) {
                   setStatus('listening')
                   setStatusDetail('Pronto! Fale com o agente a qualquer momento.')

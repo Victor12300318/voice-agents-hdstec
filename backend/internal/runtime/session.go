@@ -96,6 +96,7 @@ func (rt *Runtime) prepareSession(
 	orgID, agentID, convIDForVars, callerID, toNumber, callSid string,
 	cfg store.AgentConfig,
 	prov voice.Provider,
+	deferFirstMessage bool,
 ) (*preparedSession, error) {
 	ps := &preparedSession{
 		allVars:               map[string]string{},
@@ -434,21 +435,22 @@ func (rt *Runtime) prepareSession(
 	ps.systemPrompt = systemPrompt
 
 	provSess, err := prov.Connect(ctx, voice.SessionConfig{
-		AgentName:        cfg.Name,
-		Model:            cfg.Model,
-		DelegationModel:  cfg.SystemToolsConfig.DelegationModel,
-		ReasoningEffort:  cfg.SystemToolsConfig.ReasoningEffort,
-		Voice:            cfg.Voice,
-		Language:         cfg.Language,
-		SystemPrompt:     systemPrompt,
-		VoicePrompt:      rawRenderedPrompt,
-		SpeakerPrompt:    speakerExplicitPrompt,
-		ReasonerPrompt:   reasonerPrompt,
-		PersonalityPacks: cfg.SystemToolsConfig.PersonalityPacks,
-		SkillSummaries:   skillSummaries,
-		FirstMessage:     firstMessage,
-		ThinkingLevel:    "",
-		Tools:            ps.toolSpecs,
+		AgentName:         cfg.Name,
+		Model:             cfg.Model,
+		DelegationModel:   cfg.SystemToolsConfig.DelegationModel,
+		ReasoningEffort:   cfg.SystemToolsConfig.ReasoningEffort,
+		Voice:             cfg.Voice,
+		Language:          cfg.Language,
+		SystemPrompt:      systemPrompt,
+		VoicePrompt:       rawRenderedPrompt,
+		SpeakerPrompt:     speakerExplicitPrompt,
+		ReasonerPrompt:    reasonerPrompt,
+		PersonalityPacks:  cfg.SystemToolsConfig.PersonalityPacks,
+		SkillSummaries:    skillSummaries,
+		FirstMessage:      firstMessage,
+		DeferFirstMessage: deferFirstMessage,
+		ThinkingLevel:     "",
+		Tools:             ps.toolSpecs,
 	})
 	if err != nil {
 		for _, ms := range ps.mcpSessions {
@@ -586,7 +588,7 @@ func (rt *Runtime) RunSessionWithOptions(
 			}
 			prewarmPS.cleanup()
 		}
-		ps, err = rt.prepareSession(ctx, startedAt, orgID, agentID, conv.ID, callerID, opts.ToNumber, opts.CallSid, cfg, prov)
+		ps, err = rt.prepareSession(ctx, startedAt, orgID, agentID, conv.ID, callerID, opts.ToNumber, opts.CallSid, cfg, prov, direction == "inbound" || direction == "outbound")
 		if err != nil {
 			if ps != nil {
 				for _, dev := range ps.deferredEvents {
@@ -676,17 +678,6 @@ func (rt *Runtime) RunSessionWithOptions(
 		time.AfterFunc(5*time.Second, func() {
 			ignoringCallerAudio.Store(false)
 		})
-	}
-
-	// 5. Inicia First Message se configurada (se o provider já não disparou no Connect)
-	if firstMessage != "" {
-		recordEventAsync("first_message_sent", map[string]any{"text": firstMessage})
-		if primer, ok := provSess.(voice.FirstMessagePrimer); !ok || !primer.FirstMessagePrimed() {
-			instruction := fmt.Sprintf("ATENÇÃO (PRIMEIRO TURNO DA LIGAÇÃO): Diga agora APENAS e EXATAMENTE a seguinte frase de saudação e aguarde em silêncio o cliente responder (NÃO fale a apresentação da empresa ainda neste turno):\n\"%s\"", firstMessage)
-			if err := provSess.SendText(instruction); err != nil {
-				rt.Log.Warn("first_message_send_failed", "conversation_id", conv.ID, "error", err)
-			}
-		}
 	}
 
 	// Timer de duração máxima
@@ -1985,6 +1976,42 @@ func (rt *Runtime) RunSessionWithOptions(
 			}
 		}
 	}()
+
+	// 5. Inicia First Message SOMENTE após a Goroutine A e o canal de áudio do Caller já estarem ativos
+	if firstMessage != "" {
+		sendOpeningGreeting := func() {
+			recordEventAsync("first_message_sent", map[string]any{"text": firstMessage})
+			cur := getProvSess()
+			if cur == nil {
+				return
+			}
+			if starter, ok := cur.(voice.FirstMessageStarter); ok {
+				if err := starter.TriggerFirstMessage(firstMessage); err != nil {
+					rt.Log.Warn("first_message_send_failed", "conversation_id", conv.ID, "error", err)
+				}
+				return
+			}
+			if primer, ok := cur.(voice.FirstMessagePrimer); !ok || !primer.FirstMessagePrimed() {
+				instruction := fmt.Sprintf("ATENÇÃO (PRIMEIRO TURNO DA LIGAÇÃO): Diga agora APENAS e EXATAMENTE a seguinte frase de saudação e aguarde em silêncio o cliente responder (NÃO fale a apresentação da empresa ainda neste turno):\n\"%s\"", firstMessage)
+				if err := cur.SendText(instruction); err != nil {
+					rt.Log.Warn("first_message_send_failed", "conversation_id", conv.ID, "error", err)
+				}
+			}
+		}
+		if direction == "inbound" || direction == "outbound" {
+			// Em telefonia PSTN/SIP (Twilio/Jambonz), aguarda 250ms de cut-through da operadora
+			// para garantir que a primeira sílaba ("Boa tarde...") nunca seja cortada na linha.
+			go func() {
+				select {
+				case <-time.After(250 * time.Millisecond):
+					sendOpeningGreeting()
+				case <-sessionCtx.Done():
+				}
+			}()
+		} else {
+			sendOpeningGreeting()
+		}
+	}
 
 	// Goroutine B: Timeout de duração máxima
 	go func() {

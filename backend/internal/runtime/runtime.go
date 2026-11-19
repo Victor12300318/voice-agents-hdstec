@@ -72,7 +72,7 @@ func (rt *Runtime) PrewarmCall(
 	go func() {
 		lifeCtx, cancelLife := context.WithCancel(context.Background())
 		setupTimer := time.AfterFunc(15*time.Second, cancelLife)
-		ps, err := rt.prepareSession(lifeCtx, time.Now(), orgID, agentID, callSid, callerID, calledNumber, callSid, cfg, prov)
+		ps, err := rt.prepareSession(lifeCtx, time.Now(), orgID, agentID, callSid, callerID, calledNumber, callSid, cfg, prov, true)
 		setupTimer.Stop()
 		if err != nil {
 			cancelLife()

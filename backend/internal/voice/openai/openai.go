@@ -277,18 +277,13 @@ func (p *Provider) Connect(ctx context.Context, cfg voice.SessionConfig) (voice.
 		return nil, err
 	}
 
-	if fm := strings.TrimSpace(cfg.FirstMessage); fm != "" {
+	if !cfg.DeferFirstMessage {
 		select {
 		case <-sess.updatedCh:
 		case <-time.After(1200 * time.Millisecond):
 		case <-ctx.Done():
 			_ = sess.Close()
 			return nil, ctx.Err()
-		}
-		sess.startedTime = time.Now()
-		sess.firstMessagePrimed = true
-		if err := sess.SendText(firstMessagePrompt(fm)); err != nil {
-			sess.firstMessagePrimed = false
 		}
 	}
 	return sess, nil
@@ -559,14 +554,18 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 	reasoningEffort := resolveReasoningEffort(cfg.ReasoningEffort)
 	liveTools := openAILiveTools(cfg.Tools)
 
+	seededGreeting := !cfg.DeferFirstMessage && firstMsg != ""
+
 	sess := &openAILiveSession{
-		conn:                  conn,
-		events:                make(chan voice.Event, 256),
-		startedCh:             make(chan struct{}),
-		stopCh:                make(chan struct{}),
-		startedTime:           time.Now(),
-		hasTools:              len(liveTools) > 0,
-		activeDelegationModel: delegationModel,
+		conn:                    conn,
+		events:                  make(chan voice.Event, 256),
+		startedCh:               make(chan struct{}),
+		stopCh:                  make(chan struct{}),
+		startedTime:             time.Now(),
+		hasTools:                len(liveTools) > 0,
+		lang:                    cfg.Language,
+		seededDeveloperGreeting: seededGreeting,
+		activeDelegationModel:   delegationModel,
 	}
 	// Começa zerado para o relógio de áudio disparar imediatamente na primeira fala antes do microfone conectar
 	sess.lastAudioAt.Store(0)
@@ -608,8 +607,8 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 	}
 
 	// Guia oficial "Greet before the caller speaks": injeta a instrução de saudação em session.input
-	// (role: "developer") para estar disponível já no instante t=0ms do startup.
-	if firstMsg != "" {
+	// apenas quando a chamada já está conectada (não durante o PrewarmCall de telefonia enquanto o telefone toca).
+	if seededGreeting {
 		sessionObj["input"] = []map[string]any{
 			{
 				"type": "message",
@@ -647,14 +646,9 @@ func (p *Provider) connectLive(ctx context.Context, cfg voice.SessionConfig) (vo
 	}
 
 	sess.startedTime = time.Now()
-	if firstMsg != "" {
-		sess.firstMessagePrimed = true
-		if err := sess.triggerFirstMessage(firstMsg, cfg.Language); err != nil {
-			sess.firstMessagePrimed = false
-		}
+	if !cfg.DeferFirstMessage && firstMsg == "" {
+		sess.ensureKeepalive()
 	}
-
-	go sess.silenceKeepaliveLoop()
 	return sess, nil
 }
 
@@ -698,10 +692,13 @@ type openAILiveSession struct {
 	startedOnce              sync.Once
 	stopCh                   chan struct{}
 	stopOnce                 sync.Once
+	keepaliveOnce            sync.Once
 	writeMu                  sync.Mutex
 	mu                       sync.Mutex
 	closed                   bool
 	hasTools                 bool
+	lang                     string
+	seededDeveloperGreeting  bool
 	activeDelegationModel    string
 	fallbackAttempt          int
 	firstMessagePrimed       bool
@@ -717,12 +714,17 @@ type openAILiveSession struct {
 	silentTailSent           atomic.Int32
 	turnTimer                *time.Timer
 	speechTimer              *time.Timer
-	firstMsgRetryTimer       *time.Timer
 	prevInSample             int32
 	hasPrevSample            bool
 }
 
 func (s *openAILiveSession) FirstMessagePrimed() bool { return s.firstMessagePrimed }
+
+func (s *openAILiveSession) ensureKeepalive() {
+	s.keepaliveOnce.Do(func() {
+		go s.silenceKeepaliveLoop()
+	})
+}
 
 func isAudiblePCM16(pcm []byte) bool {
 	num := len(pcm) / 2
@@ -797,48 +799,36 @@ func (s *openAILiveSession) primeAudioClock(frames int) {
 	}
 }
 
-func (s *openAILiveSession) triggerFirstMessage(firstMsg, lang string) error {
-	// Guia oficial "Greet before the caller speaks": após session.started, envia session.commentary.append
-	// com delegation_id: null e mantém o stream de áudio ativo.
+func (s *openAILiveSession) TriggerFirstMessage(firstMessage string) error {
+	fm := strings.TrimSpace(firstMessage)
+	if fm == "" {
+		s.ensureKeepalive()
+		return nil
+	}
+	s.startedTime = time.Now()
+	s.firstMessagePrimed = true
+	s.lastAudioAt.Store(0)
+
+	eventType := "session.instructions.append"
+	if s.seededDeveloperGreeting {
+		eventType = "session.commentary.append"
+	}
 	if err := s.writeJSON(map[string]any{
-		"type":          "session.commentary.append",
+		"type":          eventType,
 		"event_id":      s.nextEventID("greeting"),
 		"delegation_id": nil,
-		"content":       liveGreetingInstruction(firstMsg, lang),
+		"content":       liveGreetingInstruction(fm, s.lang),
 	}); err != nil {
+		s.firstMessagePrimed = false
 		return err
 	}
 	s.primeAudioClock(6)
-
-	// Watchdog: caso o modelo ainda não tenha emitido áudio após 950ms, envia session.instructions.append
-	// (disclosure exato conforme guia "Deliver a disclosure") + avanço de relógio.
-	s.mu.Lock()
-	if s.firstMsgRetryTimer != nil {
-		s.firstMsgRetryTimer.Stop()
-	}
-	s.firstMsgRetryTimer = time.AfterFunc(950*time.Millisecond, func() {
-		if s.firstOutputAudioReceived.Load() {
-			return
-		}
-		s.mu.Lock()
-		cl := s.closed
-		s.mu.Unlock()
-		if cl {
-			return
-		}
-		_ = s.writeJSON(map[string]any{
-			"type":          "session.instructions.append",
-			"event_id":      s.nextEventID("greeting_retry"),
-			"delegation_id": nil,
-			"content":       fmt.Sprintf("Immediately say the following greeting in full and then wait for the caller: %s", firstMsg),
-		})
-		s.primeAudioClock(4)
-	})
-	s.mu.Unlock()
+	s.ensureKeepalive()
 	return nil
 }
 
 func (s *openAILiveSession) SendAudio(pcm16k []byte) error {
+	s.ensureKeepalive()
 	s.mu.Lock()
 	pcm24k := upsample16to24Stateful(pcm16k, &s.prevInSample, &s.hasPrevSample)
 	s.mu.Unlock()
@@ -859,6 +849,7 @@ func (s *openAILiveSession) SendAudio(pcm16k []byte) error {
 }
 
 func (s *openAILiveSession) SendText(text string) error {
+	s.ensureKeepalive()
 	if err := s.writeJSON(map[string]any{
 		"type":          "session.instructions.append",
 		"event_id":      s.nextEventID("inst"),
@@ -905,9 +896,6 @@ func (s *openAILiveSession) Close() error {
 	}
 	if s.speechTimer != nil {
 		s.speechTimer.Stop()
-	}
-	if s.firstMsgRetryTimer != nil {
-		s.firstMsgRetryTimer.Stop()
 	}
 	s.mu.Unlock()
 	_ = s.writeJSON(map[string]string{"type": "session.close"})
@@ -1165,6 +1153,26 @@ type openAISession struct {
 }
 
 func (s *openAISession) FirstMessagePrimed() bool { return s.firstMessagePrimed }
+
+func (s *openAISession) TriggerFirstMessage(firstMessage string) error {
+	fm := strings.TrimSpace(firstMessage)
+	if fm == "" {
+		return nil
+	}
+	if s.updatedCh != nil {
+		select {
+		case <-s.updatedCh:
+		case <-time.After(800 * time.Millisecond):
+		}
+	}
+	s.startedTime = time.Now()
+	s.firstMessagePrimed = true
+	if err := s.SendText(firstMessagePrompt(fm)); err != nil {
+		s.firstMessagePrimed = false
+		return err
+	}
+	return nil
+}
 
 // upsample16to24Bytes converte PCM16 LE de 16000 Hz para 24000 Hz (razão 2 -> 3).
 func upsample16to24Bytes(pcm16k []byte) []byte {

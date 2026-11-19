@@ -142,13 +142,6 @@ func (p *Provider) Connect(ctx context.Context, cfg voice.SessionConfig) (voice.
 	}
 	sess := &session{s: s, events: make(chan voice.Event, 256), startedTime: time.Now()}
 	go sess.readLoop()
-	if fm := strings.TrimSpace(cfg.FirstMessage); fm != "" {
-		sess.firstMessagePrimed = true
-		instruction := fmt.Sprintf("ATENÇÃO (PRIMEIRO TURNO DA LIGAÇÃO): Diga agora APENAS e EXATAMENTE a seguinte frase de saudação e aguarde em silêncio o cliente responder (NÃO fale a apresentação da empresa ainda neste turno):\n%q", fm)
-		if err := sess.SendText(instruction); err != nil {
-			sess.firstMessagePrimed = false
-		}
-	}
 	return sess, nil
 }
 
@@ -204,6 +197,21 @@ type session struct {
 }
 
 func (s *session) FirstMessagePrimed() bool { return s.firstMessagePrimed }
+
+func (s *session) TriggerFirstMessage(firstMessage string) error {
+	fm := strings.TrimSpace(firstMessage)
+	if fm == "" {
+		return nil
+	}
+	s.startedTime = time.Now()
+	s.firstMessagePrimed = true
+	instruction := fmt.Sprintf("ATENÇÃO (PRIMEIRO TURNO DA LIGAÇÃO): Diga agora APENAS e EXATAMENTE a seguinte frase de saudação e aguarde em silêncio o cliente responder (NÃO fale a apresentação da empresa ainda neste turno):\n%q", fm)
+	if err := s.SendText(instruction); err != nil {
+		s.firstMessagePrimed = false
+		return err
+	}
+	return nil
+}
 
 func (s *session) SendAudio(pcm []byte) error {
 	if s.firstMessagePrimed && !s.firstOutputAudioReceived.Load() && time.Since(s.startedTime) < 2500*time.Millisecond {

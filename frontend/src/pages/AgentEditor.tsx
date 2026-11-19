@@ -821,6 +821,7 @@ export default function AgentEditor() {
             const data = JSON.parse(event.data)
             if (data.type === 'ready') {
               wsReady = true
+              void player.resume()
               setCallStatus('active')
               timerRef.current = setInterval(() => {
                 setCallDuration((d) => d + 1)

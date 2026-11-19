@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -32,7 +33,8 @@ type CallTransport interface {
 
 // WebSocketTransport implementa CallTransport para conexões WebSocket do navegador.
 type WebSocketTransport struct {
-	conn *websocket.Conn
+	conn    *websocket.Conn
+	writeMu sync.Mutex
 }
 
 func NewWebSocketTransport(conn *websocket.Conn) *WebSocketTransport {
@@ -57,6 +59,8 @@ func (t *WebSocketTransport) ReadEvent(ctx context.Context) (TransportEvent, err
 }
 
 func (t *WebSocketTransport) SendAudio(ctx context.Context, data []byte) error {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	writeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	return t.conn.Write(writeCtx, websocket.MessageBinary, data)
@@ -67,6 +71,8 @@ func (t *WebSocketTransport) SendMessage(ctx context.Context, msg serverMessage)
 	if err != nil {
 		return err
 	}
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	writeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	return t.conn.Write(writeCtx, websocket.MessageText, data)

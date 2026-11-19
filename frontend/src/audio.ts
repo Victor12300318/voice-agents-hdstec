@@ -226,7 +226,10 @@ export class AudioPlayer {
     const AudioContextClass =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
-    this.audioCtx = new AudioContextClass({ sampleRate, latencyHint: 'interactive' })
+    // Abre o AudioContext na taxa nativa do sistema operacional (ex.: 48kHz) para evitar conflito
+    // de hardware no Windows/Bluetooth quando o getUserMedia abre o microfone em paralelo;
+    // o createBuffer(..., 24000) faz o reamostramento nativo C++ com precisão exata.
+    this.audioCtx = new AudioContextClass({ latencyHint: 'interactive' })
     this.analyser = this.audioCtx.createAnalyser()
     this.analyser.fftSize = 256
     this.analyser.smoothingTimeConstant = 0.8
